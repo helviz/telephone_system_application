@@ -9,6 +9,9 @@ x-logging: &default-logging
 services:
   # ─────────────────────────────────────────────
   # API Gateway (FastAPI)
+  # Handles Twilio webhooks, orchestrates STT → LLM → TTS pipeline.
+  # Twilio webhooks hit POST /call/incoming  (TwiML voice response)
+  # Twilio Media Streams hit WS  /stream/{call_sid}
   # ─────────────────────────────────────────────
   api:
     build:
@@ -19,24 +22,31 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - TELNYX_API_KEY=${TELNYX_API_KEY}
-      - TELNYX_PUBLIC_KEY=${TELNYX_PUBLIC_KEY}
-      - TELNYX_APP_ID=${TELNYX_APP_ID}
-      - BASE_URL=${BASE_URL}
+      # ── Twilio credentials ──────────────────
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      # ── Twilio webhook validation ───────────
+      # Set to "true" in production to validate X-Twilio-Signature headers
+      - TWILIO_VALIDATE_SIGNATURE=${TWILIO_VALIDATE_SIGNATURE:-true}
+      # ── Service mesh ────────────────────────
+      - BASE_URL=${BASE_URL}                        # e.g. https://your-domain.com
       - STT_URL=http://stt:8001
       - LLM_URL=http://llm:8002
       - TTS_URL=http://tts:8003
       - REDIS_URL=redis://redis:6379/0
-      - DATABASE_URL=postgresql+asyncpg://voice:voice@postgres:5432/voicedb
+      # ── Database ────────────────────────────
+      # Points to the local postgres service (overrides any Supabase URL)
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-voice}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voicedb}
       - AUDIO_DIR=/audio
       - LOG_LEVEL=INFO
     volumes:
       - audio_files:/audio
       - ./logs:/logs
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
       stt:
         condition: service_started
@@ -54,7 +64,16 @@ services:
       retries: 3
 
   # ─────────────────────────────────────────────
-  # STT Service (faster-whisper)
+  # STT Service (faster-whisper + Silero VAD)
+  # Exposes:
+  #   POST /transcribe        — full-file transcription
+  #   POST /transcribe_vad    — VAD-segmented transcription
+  #   WS   /stream/{call_sid} — Twilio Media Stream WebSocket
+  #
+  # Twilio Media Streams send mulaw 8kHz audio — the STT service
+  # must resample to 16kHz before passing to Whisper.
+  # VAD detects end-of-speech, cutting latency vs waiting for Twilio
+  # to hang up or hit a silence timeout on its own.
   # ─────────────────────────────────────────────
   stt:
     build:
@@ -69,6 +88,18 @@ services:
       - DEVICE=cpu
       - COMPUTE_TYPE=int8
       - LOG_LEVEL=INFO
+      - REDIS_URL=redis://redis:6379/0
+      # ── VAD settings ──────────────────────────
+      # 0.8 s silence = end of turn; tune down to 0.5 s for snappier feel
+      - VAD_SILENCE_THRESHOLD_S=${VAD_SILENCE_THRESHOLD_S:-0.8}
+      - VAD_MIN_SPEECH_DURATION_S=${VAD_MIN_SPEECH_DURATION_S:-0.3}
+      - VAD_THRESHOLD=${VAD_THRESHOLD:-0.5}
+      - VAD_CHUNK_MS=${VAD_CHUNK_MS:-32}
+      # ── Twilio audio format ───────────────────
+      # Twilio Media Streams deliver mulaw 8kHz; resample to 16kHz for Whisper
+      - TWILIO_AUDIO_ENCODING=mulaw
+      - TWILIO_SAMPLE_RATE=8000
+      - WHISPER_SAMPLE_RATE=16000
     volumes:
       - whisper_models:/root/.cache/huggingface
       - audio_files:/audio
@@ -82,7 +113,9 @@ services:
 
   # ─────────────────────────────────────────────
   # LLM Service (Google Gemini API)
-  # No local model — pure API call, ~200-400ms latency
+  # No local model — pure API call, ~200-400 ms latency.
+  # Keep MAX_TOKENS low (≤150) so TTS starts fast and
+  # Twilio's 5-second TwiML response deadline is not hit.
   # ─────────────────────────────────────────────
   llm:
     build:
@@ -109,6 +142,10 @@ services:
 
   # ─────────────────────────────────────────────
   # TTS Service (Piper)
+  # Generates audio files served by Nginx.
+  # The API returns a TwiML <Play> pointing at
+  # https://${BASE_URL}/audio/<file>.wav so Twilio
+  # fetches and streams it to the caller.
   # ─────────────────────────────────────────────
   tts:
     build:
@@ -130,30 +167,42 @@ services:
     logging: *default-logging
 
   # ─────────────────────────────────────────────
-  # PostgreSQL
+  # PostgreSQL 16
+  # Stores call records, transcripts, and agent sessions.
+  #
+  # Suggested schema (run via Alembic or init SQL):
+  #   calls        (call_sid PK, from_number, to_number, status, started_at, ended_at)
+  #   transcripts  (id PK, call_sid FK, role, text, created_at)
+  #   sessions     (call_sid PK, context JSONB, updated_at)
   # ─────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: voice_postgres
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=voice
-      - POSTGRES_PASSWORD=voice
-      - POSTGRES_DB=voicedb
+      - POSTGRES_USER=${POSTGRES_USER:-voice}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}        # required — set in ..env.example
+      - POSTGRES_DB=${POSTGRES_DB:-voicedb}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./services/api/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
+      # Drop .sql or .sh init scripts here and they run on first boot
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     networks:
       - voice_net
     logging: *default-logging
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U voice -d voicedb"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voice} -d ${POSTGRES_DB:-voicedb}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   # ─────────────────────────────────────────────
-  # Redis
+  # Redis  (session state, call context cache,
+  #         transcript pub/sub channel)
   # ─────────────────────────────────────────────
   redis:
     image: redis:7-alpine
@@ -173,6 +222,13 @@ services:
 
   # ─────────────────────────────────────────────
   # Nginx (reverse proxy + audio file server)
+  # ── Critical for Twilio ──────────────────────
+  # • Must proxy WebSocket upgrades for /stream/* so Twilio
+  #   Media Streams can connect (Upgrade: websocket header).
+  # • /audio/ must be publicly reachable over HTTPS because
+  #   Twilio fetches <Play> URLs from its own servers, not
+  #   from inside your network.
+  # • TLS cert is mandatory — Twilio rejects plain HTTP <Play>.
   # ─────────────────────────────────────────────
   nginx:
     image: nginx:alpine
@@ -192,12 +248,11 @@ services:
     logging: *default-logging
 
 volumes:
-  postgres_data:
   redis_data:
+  postgres_data:
   audio_files:
   whisper_models:
   piper_models:
-  # ollama_models volume removed — no local LLM
 
 networks:
   voice_net:
