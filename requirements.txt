@@ -12,27 +12,27 @@
 # =============================================================
 
 # ── Web framework ─────────────────────────────────────────────
-fastapi==0.111.0
-uvicorn[standard]==0.111.0     # keep in sync with fastapi
-websockets>=12.0               # required by uvicorn --ws websockets (Twilio stream)
-python-multipart>=0.0.9        # FastAPI File(...) / Form(...) uploads
+fastapi
+uvicorn[standard]              # keep in sync with fastapi
+websockets                     # required by uvicorn --ws websockets (Twilio stream)
+python-multipart               # FastAPI File(...) / Form(...) uploads
 
 # ── HTTP client (twilio_routes.py → LLM + TTS service calls) ──
-httpx>=0.27.0
+httpx
 
 # ── Twilio SDK (twilio_routes.py) ────────────────────────────
-twilio>=9.0.0
+twilio
 
 # ── STT — speech recognition ─────────────────────────────────
-faster-whisper==1.0.3
+faster-whisper
 
 # ── VAD — voice activity detection ───────────────────────────
 # silero-vad loads via torch.hub; the pip package pins the weights.
-silero-vad>=5.1
+silero-vad
 
 # ── Audio processing ──────────────────────────────────────────
-numpy>=1.26.0,<2.0             # used directly in main.py (_ulaw_to_float32, etc.)
-soundfile>=0.12.1              # WAV decoding in _audio_bytes_to_float32
+numpy                          # used directly in main.py (_ulaw_to_float32, etc.)
+soundfile                      # WAV decoding in _audio_bytes_to_float32
 # audioop is stdlib on Python ≤ 3.12 (used for µ-law decode + resample).
 # audioop-lts is the backport for Python 3.13+ — installed conditionally
 # in the Dockerfile, NOT listed here to avoid breaking Python 3.11/3.12.
@@ -43,7 +43,7 @@ soundfile>=0.12.1              # WAV decoding in _audio_bytes_to_float32
 # and balloon the image from ~800 MB to ~5 GB.
 
 # ── Redis ─────────────────────────────────────────────────────
-redis[asyncio]>=5.0.0          # aioredis.from_url used in both main.py and twilio_routes.py
+redis[asyncio]                 # aioredis.from_url used in both main.py and twilio_routes.py
 
 # ── Logging ───────────────────────────────────────────────────
-structlog>=24.1.0
+structlog
