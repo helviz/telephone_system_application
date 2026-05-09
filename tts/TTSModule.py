@@ -1,55 +1,73 @@
 import torch
-from TTS.api import TTS
 from transformers import VitsModel, AutoTokenizer
 
 
 class TTSModule:
-    def __init__(self, lang="en"):
-        self.lang = lang
+    def __init__(self, output):
+        self.output = output
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load models based on language
-        if self.lang in ["en", "fr"]:
-            # Coqui XTTS v2
-            self.model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(self.device)
+        self.model_map = {
+            "en": "facebook/mms-tts-eng",
+            "fr": "facebook/mms-tts-fra",
+            "sw": "facebook/mms-tts-swh",
+        }
 
-        elif self.lang == "sw":
-            # Facebook MMS Swahili
-            self.model_name = "facebook/mms-tts-swh"
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self.model = VitsModel.from_pretrained(self.model_name).to(self.device)
+        self.models = {}
+        self.tokenizers = {}
 
-    async def speak_stream(self, text_generator):
-        """Processes the LLM stream and sends text to synthesis."""
+    def load_language(self, lang="en"):
+        if lang not in self.model_map:
+            raise ValueError(f"Unsupported language: {lang}")
+
+        model_name = self.model_map[lang]
+        print(f"[TTS] Loading model: {model_name}")
+
+        self.tokenizers[lang] = AutoTokenizer.from_pretrained(model_name)
+        self.models[lang] = VitsModel.from_pretrained(model_name).to(self.device)
+        self.models[lang].eval()
+
+        print(f"[TTS] Loaded {lang} on {self.device}")
+
+    async def speak_stream(self, text_generator, lang="en"):
+        if lang not in self.models:
+            self.load_language(lang)
+
+        model = self.models[lang]
+        tokenizer = self.tokenizers[lang]
+
         buffer = ""
+
         async for chunk in text_generator:
             buffer += chunk
-            if any(punc in chunk for punc in [".", "!", "?", "\n"]):
+
+            if any(p in chunk for p in [".", "!", "?", "\n"]):
                 sentence = buffer.strip()
                 if sentence:
-                    await self._generate_audio(sentence)
+                    await self._generate_audio(sentence, model, tokenizer)
                     buffer = ""
 
-    async def _generate_audio(self, text: str):
-        if self.lang in ["en", "fr"]:
-            # Coqui synthesis (Note: uses a reference wav for voice cloning)
-            # You need a 5-10 second sample.wav in your project folder
-            self.model.tts_to_file(
-                text=text,
-                speaker_wav="sample.wav",
-                language=self.lang,
-                file_path="output.wav"
-            )
-        elif self.lang == "sw":
-            # Facebook MMS synthesis
-            inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                output = self.model(**inputs).waveform
-            # Convert output tensor to audio and play (using sounddevice or simpleaudio)
-            self._play_tensor(output)
+        if buffer.strip():
+            await self._generate_audio(buffer.strip(), model, tokenizer)
 
-    def _play_tensor(self, waveform):
-        # Implementation for playing raw tensor audio
-        import sounddevice as sd
-        sd.play(waveform.cpu().numpy().squeeze(), samplerate=16000)
-        sd.wait()
+    async def _generate_audio(self, text, model, tokenizer):
+        inputs = tokenizer(text, return_tensors="pt").to(self.device)
+
+        with torch.inference_mode():
+            waveform = model(**inputs).waveform
+
+        await self.output.send_audio(waveform, sample_rate=model.config.sampling_rate)
+
+
+# # English
+# wget https://huggingface.co/facebook/mms-tts-eng/resolve/main/model.safetensors -O mms-tts-eng.safetensors
+# wget https://huggingface.co/facebook/mms-tts-eng/resolve/main/config.json -O mms-tts-eng-config.json
+#
+# # French
+# wget https://huggingface.co/facebook/mms-tts-fra/resolve/main/model.safetensors -O mms-tts-fra.safetensors
+# wget https://huggingface.co/facebook/mms-tts-fra/resolve/main/config.json -O mms-tts-fra-config.json
+#
+# # Swahili
+# wget https://huggingface.co/facebook/mms-tts-swh/resolve/main/model.safetensors -O mms-tts-swh.safetensors
+# wget https://huggingface.co/facebook/mms-tts-swh/resolve/main/config.json -O mms-tts-swh-config.json
+
