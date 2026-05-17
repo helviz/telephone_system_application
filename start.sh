@@ -3,6 +3,6 @@
 set -e
 
 echo "🚀 Starting Voice Assistant..."
-
+export PORT=7860
 # Start your app
-python3 -m tests.test_phone
+python3 sockets.py
