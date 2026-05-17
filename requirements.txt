@@ -3,7 +3,7 @@ uvicorn[standard]==0.47.0
 python-dotenv==1.2.2
 pydantic==2.13.4
 
-llama-cpp-python==0.3.22
+llama_cpp_python @ https://huggingface.co/Luigi/llama-cpp-python-wheels-hf-spaces-free-cpu/resolve/main/llama_cpp_python-0.3.22-cp310-cp310-linux_x86_64.whl
 
 flask==3.1.3
 
