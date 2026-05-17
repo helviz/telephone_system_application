@@ -1,0 +1,39 @@
+# ── Web framework ──────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+starlette==0.41.0
+python-dotenv==1.0.0
+pydantic==2.7.0
+
+# ── Twilio ─────────────────────────────────────────────────
+twilio==9.2.0
+
+# ── HTTP clients ───────────────────────────────────────────
+httpx==0.27.0
+requests==2.32.0
+aiohttp==3.9.5
+
+# ── Speech-to-text ─────────────────────────────────────────
+faster-whisper==1.0.3
+ctranslate2==4.4.0
+
+# ── TTS (Coqui) ────────────────────────────────────────────
+TTS==0.22.0
+
+# ── Audio processing ───────────────────────────────────────
+librosa==0.10.1
+soundfile==0.12.1
+scipy==1.13.0
+numpy==1.26.4
+
+# ── Google / Gemini (if used) ──────────────────────────────
+google-genai==1.5.0
+google-auth==2.29.0
+
+# ── Misc utils ─────────────────────────────────────────────
+pyyaml==6.0.1
+tqdm==4.66.4
+psutil==5.9.8
+python-dateutil==2.9.0
+tenacity==8.3.0
+websockets==12.0
