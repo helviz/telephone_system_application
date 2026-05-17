@@ -1,37 +1,31 @@
-# ── Web framework ──────────────────────────────────────────
+# Web framework
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
 python-dotenv==1.0.0
 pydantic==2.7.0
 
-# ── Twilio ─────────────────────────────────────────────────
+# Twilio
 twilio==9.2.0
 
-# ── HTTP clients ───────────────────────────────────────────
+# HTTP
 httpx>=0.28.1
 requests==2.32.0
 aiohttp==3.9.5
 
-# ── Speech-to-text ─────────────────────────────────────────
-faster-whisper==1.0.3
+# ML compatibility lock (IMPORTANT)
+transformers==4.41.0
 
-# ── TTS (Coqui) — let pip resolve all its sub-deps freely ──
-TTS==0.22.0
-
-# ── Audio processing — unpinned to not fight TTS ───────────
+# Audio processing
 librosa
 soundfile
 scipy
 numpy
 
-# ── Google / Gemini ────────────────────────────────────────
+# Google / Gemini
 google-genai==1.5.0
 google-auth==2.29.0
 
-# ── LLM / Local Inference ──────────────────────────────────
-llama-cpp-python==0.3.1
-
-# ── Misc utils ─────────────────────────────────────────────
+# Utils
 pyyaml
 tqdm
 psutil
