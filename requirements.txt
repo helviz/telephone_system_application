@@ -29,6 +29,9 @@ numpy
 google-genai==1.5.0
 google-auth==2.29.0
 
+# ── LLM / Local Inference ──────────────────────────────────
+llama-cpp-python==0.3.1
+
 # ── Misc utils ─────────────────────────────────────────────
 pyyaml
 tqdm
