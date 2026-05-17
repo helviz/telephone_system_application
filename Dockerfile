@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# 1. System deps: Added build-essential and python3-dev so llama-cpp can compile!
+# 1. System deps: Added build-essential, python3-dev, and patchelf
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3-dev \
@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     curl \
     ca-certificates \
+    patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Upgrade pip & install wheels to speed up compilation steps
@@ -23,12 +24,14 @@ RUN pip install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 # 4. Layer 2 Cache: Install heavy audio/ML dependencies next
-# (Now with the compiler installed, llama-cpp-python will compile successfully)
 RUN pip install --no-cache-dir \
     TTS==0.22.0 \
     faster-whisper==1.0.3 \
     ctranslate2==4.4.0 \
     llama-cpp-python==0.3.1
+
+# FIX: Clear the executable stack requirement flag from the ctranslate2 binary
+RUN find /usr/local/lib/python3.10/site-packages/ctranslate2/ -name "*.so*" -exec patchelf --clear-execstack {} \;
 
 # 5. Layer 3 Cache: Copy requirements.txt and install remaining lightweight packages
 COPY requirements.txt .
