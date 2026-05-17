@@ -30,4 +30,4 @@ RUN chmod +x /app/start.sh
 # HF Spaces requires the app to listen on 0.0.0.0:7860
 EXPOSE 7860
 
-CMD ["bash", "/app/start.sh"]
+CMD ["bash", "./start.sh"]
