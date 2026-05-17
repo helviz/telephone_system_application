@@ -23,7 +23,6 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     TTS==0.22.0 \
     faster-whisper==1.0.3 \
-    ctranslate2==4.4.0 \
     llama-cpp-python==0.3.1
 
 # IMPORTANT FIX

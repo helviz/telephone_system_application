@@ -14,7 +14,6 @@ aiohttp==3.9.5
 
 # ── Speech-to-text ─────────────────────────────────────────
 faster-whisper==1.0.3
-ctranslate2==4.4.0
 
 # ── TTS (Coqui) — let pip resolve all its sub-deps freely ──
 TTS==0.22.0
