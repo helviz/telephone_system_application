@@ -1,16 +1,71 @@
 import asyncio
+import os
+import re
+from typing import cast, Any
 from llama_cpp import Llama
 from llmModule.LLMStrategy import LLMStrategy
+from huggingface_hub import hf_hub_download
 
 
 class GGUFStrategy(LLMStrategy):
-    def __init__(self, model_path: str, system_prompt: str):
+    def __init__(self, model_path: str = None, system_prompt: str = ""):
         super().__init__(system_prompt)
-        # n_ctx is the context window. Qwen models usually support large windows.
+
+        # 1. Fetch configurations directly from Hugging Face Space Variables/Secrets
+        hf_model_env = os.getenv("GGUF_MODEL", "").strip()
+        gpu_layers = int(os.getenv("N_GPU_LAYERS", "0"))  # 0 for CPU, -1 for GPU
+        ctx_size = int(os.getenv("N_CTX", "2048"))
+
+        resolved_path = None
+
+        # 2. Determine model source: HF link or local fallback
+        if hf_model_env:
+            print(f"HF_MODEL variable detected: {hf_model_env}")
+            try:
+                # Option A: Full browser URL (blob or resolve links)
+                if "huggingface.co/" in hf_model_env:
+                    url_pattern = r"huggingface\.co/([^/]+/[^/]+)/(?:blob|resolve)/[^/]+/(.+)"
+                    match = re.search(url_pattern, hf_model_env)
+                    if match:
+                        repo_id = match.group(1)
+                        filename = match.group(2)
+                        print(f"Parsed HF URL -> Repo: {repo_id} | File: {filename}")
+                        resolved_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                    else:
+                        raise ValueError("Could not parse Hugging Face URL structure.")
+
+                # Option B: Shorthand notation (e.g., 'username/repo/file.gguf')
+                else:
+                    parts = hf_model_env.split("/")
+                    if len(parts) >= 3:
+                        repo_id = f"{parts[0]}/{parts[1]}"
+                        filename = "/".join(parts[2:])
+                        print(f"Parsed HF Shorthand -> Repo: {repo_id} | File: {filename}")
+                        resolved_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                    else:
+                        raise ValueError("Shorthand must match 'username/repo_name/filename.gguf' format.")
+            except Exception as e:
+                print(f"❌ Error downloading from Hugging Face: {e}")
+                if model_path:
+                    print("Falling back to local model path...")
+                    resolved_path = model_path
+                else:
+                    raise e
+        else:
+            resolved_path = model_path
+
+        if not resolved_path:
+            raise ValueError(
+                "No model specified! Please configure the 'HF_MODEL' environment variable/secret "
+                "in your Hugging Face Space settings."
+            )
+
+        # 3. Initialize the model
+        print(f"Loading GGUF model from: {resolved_path} (GPU layers: {gpu_layers})")
         self.llm = Llama(
-            model_path=model_path,
-            n_ctx=2048,
-            n_gpu_layers=0  # Set to -1 if you have a GPU, 0 for CPU-only
+            model_path=resolved_path,
+            n_ctx=ctx_size,
+            n_gpu_layers=gpu_layers
         )
 
     async def generate_stream(self, user_input: str):
@@ -21,7 +76,7 @@ class GGUFStrategy(LLMStrategy):
 
         def get_stream():
             return self.llm.create_chat_completion(
-                messages=messages,
+                messages=cast(Any, messages),  # Suppresses type checker warning cleanly
                 stream=True
             )
 
@@ -33,10 +88,7 @@ class GGUFStrategy(LLMStrategy):
             delta = chunk['choices'][0]['delta']
             if 'content' in delta:
                 content = delta['content']
-                # 1. Immediate terminal feedback
                 print(content, end="", flush=True)
-
-                # 2. Yield to the TTS sentence buffer
                 yield content
 
         print("\n")
