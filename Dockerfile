@@ -1,23 +1,20 @@
-FROM python:3.10-slim
+FROM python:3.10
 
 WORKDIR /app
 
-# 1. System deps: Added build-essential, python3-dev, and patchelf
+# 1. System deps: Removed build-essential and python3-dev as they are pre-installed!
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    python3-dev \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
     curl \
     ca-certificates \
-    patchelf \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Upgrade pip & install wheels to speed up compilation steps
+# 2. Upgrade pip & install wheels
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# 3. Layer 1 Cache: Install CPU PyTorch explicitly first (Heavy download)
+# 3. Layer 1 Cache: Install CPU PyTorch explicitly first
 RUN pip install --no-cache-dir \
     torch==2.3.0+cpu \
     torchaudio==2.3.0+cpu \
@@ -29,9 +26,6 @@ RUN pip install --no-cache-dir \
     faster-whisper==1.0.3 \
     ctranslate2==4.4.0 \
     llama-cpp-python==0.3.1
-
-# FIX: Clear the executable stack requirement flag from the ctranslate2 binary
-RUN find /usr/local/lib/python3.10/site-packages/ctranslate2/ -name "*.so*" -exec patchelf --clear-execstack {} \;
 
 # 5. Layer 3 Cache: Copy requirements.txt and install remaining lightweight packages
 COPY requirements.txt .
