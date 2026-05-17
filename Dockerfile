@@ -2,8 +2,10 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# 1. System deps: audio libs + ffmpeg for faster-whisper/librosa
+# 1. System deps: Added build-essential and python3-dev so llama-cpp can compile!
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
@@ -20,8 +22,8 @@ RUN pip install --no-cache-dir \
     torchaudio==2.3.0+cpu \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
-# 4. Layer 2 Cache: Install the absolute heaviest audio/ML dependencies next
-# This isolates Coqui TTS and llama-cpp so they don't block everything else
+# 4. Layer 2 Cache: Install heavy audio/ML dependencies next
+# (Now with the compiler installed, llama-cpp-python will compile successfully)
 RUN pip install --no-cache-dir \
     TTS==0.22.0 \
     faster-whisper==1.0.3 \
