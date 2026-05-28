@@ -88,6 +88,6 @@ fastapi_app.mount("/", WSGIMiddleware(flask_app))
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", 7860))
     print(f"🚀 Starting voice assistant server on port {port}...")
     uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
