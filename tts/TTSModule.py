@@ -3,7 +3,7 @@ from transformers import VitsModel, AutoTokenizer
 
 
 class TTSModule:
-    def __init__(self, output):
+    def __init__(self, output, preloaded_models: dict = None):
         self.output = output
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -15,6 +15,19 @@ class TTSModule:
 
         self.models = {}
         self.tokenizers = {}
+
+        if preloaded_models:
+            # Accept already-loaded models from preload.py — zero disk I/O
+            for lang, (model, tokenizer) in preloaded_models.items():
+                self.models[lang] = model
+                self.tokenizers[lang] = tokenizer
+            print(f"[TTS] Using preloaded models for: {list(preloaded_models.keys())}")
+        else:
+            # Fallback: load all languages now (first-run or test mode)
+            print("[TTS] No preloaded models supplied — loading all languages now...")
+            for lang in self.model_map:
+                self.load_language(lang)
+            print("[TTS]  All language models ready.")
 
     def load_language(self, lang="en"):
         if lang not in self.model_map:
@@ -57,17 +70,3 @@ class TTSModule:
             waveform = model(**inputs).waveform
 
         await self.output.send_audio(waveform, sample_rate=model.config.sampling_rate)
-
-
-# # English
-# wget https://huggingface.co/facebook/mms-tts-eng/resolve/main/model.safetensors -O mms-tts-eng.safetensors
-# wget https://huggingface.co/facebook/mms-tts-eng/resolve/main/config.json -O mms-tts-eng-config.json
-#
-# # French
-# wget https://huggingface.co/facebook/mms-tts-fra/resolve/main/model.safetensors -O mms-tts-fra.safetensors
-# wget https://huggingface.co/facebook/mms-tts-fra/resolve/main/config.json -O mms-tts-fra-config.json
-#
-# # Swahili
-# wget https://huggingface.co/facebook/mms-tts-swh/resolve/main/model.safetensors -O mms-tts-swh.safetensors
-# wget https://huggingface.co/facebook/mms-tts-swh/resolve/main/config.json -O mms-tts-swh-config.json
-
