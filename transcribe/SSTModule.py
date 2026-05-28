@@ -8,11 +8,7 @@ import os
 load_dotenv()
 
 CHUNK_BUFFER_SIZE = 150
-
-# Minimum audio duration Whisper needs — shorter than this produces garbage
-# 150 chunks × 160 bytes × 0.5 (int16) / 16000 Hz = ~0.75s minimum anyway,
-# but we add an explicit sample count guard as a safety net.
-MIN_SAMPLES = 4000   # 0.25s at 16kHz — anything shorter is discarded
+MIN_SAMPLES = 4000
 
 
 class STTModule:
@@ -45,7 +41,11 @@ class STTModule:
                 audio_data,
                 language=self.lang,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
+                vad_parameters=dict(
+                    min_silence_duration_ms=800,
+                    threshold=0.6,              # higher = only confident speech passes
+                    min_speech_duration_ms=500, # ignore very short bursts/noise
+                ),
             )
             return [seg.text.strip() for seg in segments if seg.text.strip()]
         except Exception as e:
@@ -59,7 +59,6 @@ class STTModule:
 
         try:
             async for chunk in audio_source.get_stream():
-                # Guard: skip empty or non-bytes chunks
                 if not chunk or not isinstance(chunk, (bytes, bytearray)):
                     continue
 
@@ -69,7 +68,6 @@ class STTModule:
                     audio_bytes = b"".join(buffer)
                     buffer = []
 
-                    # Guard: must be even number of bytes for int16
                     if len(audio_bytes) % 2 != 0:
                         audio_bytes = audio_bytes[:-1]
 
@@ -78,13 +76,12 @@ class STTModule:
                         / 32768.0
                     )
 
-                    # Guard: discard chunks that are too short for Whisper
                     if len(audio_data) < MIN_SAMPLES:
-                        print(f"[STT] ⚠️  Audio chunk too short ({len(audio_data)} samples) — discarding.")
                         continue
 
-                    # Guard: discard silent chunks (all zeros / near-zero energy)
-                    if np.abs(audio_data).max() < 1e-4:
+                    # Tighter energy gate — phone mic RMS needs to be meaningful
+                    rms = np.sqrt(np.mean(audio_data ** 2))
+                    if rms < 0.01:
                         continue
 
                     texts = await loop.run_in_executor(
@@ -95,6 +92,6 @@ class STTModule:
                         yield text
 
         except asyncio.CancelledError:
-            pass  # Call ended cleanly
+            pass
         except Exception as e:
             print(f"[STT] ❌ Stream error: {e}")
