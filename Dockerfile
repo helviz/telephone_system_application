@@ -57,8 +57,8 @@ print('TTS models cached.')"
 
 RUN python3 -c "\
 from faster_whisper import WhisperModel; \
-WhisperModel('medium', device='cpu', compute_type='int8'); \
-print('Whisper medium cached.')"
+WhisperModel('small', device='cpu', compute_type='int8'); \
+print('Whisper small cached.')"
 
 EXPOSE 7860
 

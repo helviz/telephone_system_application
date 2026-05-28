@@ -23,7 +23,7 @@ class VoiceAssistant:
 
         # STT — reuse preloaded WhisperModel if available
         self.stt = STTModule(
-            model_size="medium",
+            model_size="small",
             lang=self.lang,
             preloaded_model=preloaded_whisper,
         )
