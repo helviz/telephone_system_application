@@ -46,6 +46,20 @@ COPY . .
 
 RUN chmod +x /app/start.sh
 
+# ── Pre-cache all TTS + Whisper models at build time ────────────────────────
+# This bakes the models into the image so there are zero network fetches
+# during a live call — avoids mid-call NetworkError on HF Spaces.
+RUN python3 -c "\
+from transformers import VitsModel, AutoTokenizer; \
+models = ['facebook/mms-tts-eng', 'facebook/mms-tts-fra', 'facebook/mms-tts-swh']; \
+[AutoTokenizer.from_pretrained(m) or VitsModel.from_pretrained(m) for m in models]; \
+print('TTS models cached.')"
+
+RUN python3 -c "\
+from faster_whisper import WhisperModel; \
+WhisperModel('medium', device='cpu', compute_type='int8'); \
+print('Whisper medium cached.')"
+
 EXPOSE 7860
 
 CMD ["bash", "./start.sh"]
