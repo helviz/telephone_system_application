@@ -4,7 +4,8 @@ import websockets
 
 
 #URL = "wss://helviz-gsm-voice.hf.space/twilio/voice"
-URL = "wss://helviz-gsm-voice.hf.space/twilio/voice"
+#URL = "wss://helviz-gsm-voice.hf.space/twilio/voice"
+URL = "wss://helviz-gsm-voice.hf.space/media-stream/twilio/en"
 
 async def test_connection():
     print(f"Connecting to {URL}...")
@@ -24,7 +25,7 @@ async def test_connection():
 
             # Wait to see if your backend sends a response or closes the connection
             try:
-                response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
                 print(f"Received response from backend: {response}")
             except asyncio.TimeoutError:
                 print("No immediate response from server, but connection remains open (normal for raw voice streams).")
