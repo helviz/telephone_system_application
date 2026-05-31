@@ -1,6 +1,5 @@
 from dotenv import load_dotenv
 from llmModule.GoogleGeminiStrategy import GeminiStrategy
-from llmModule.GGUFStrategy import GGUFStrategy
 import os
 
 # Load variables once at initialization
@@ -20,23 +19,25 @@ class LLM:
     def get_model(provider=None, lang="en"):
         prompt = LLM.SYSTEM_PROMPTS.get(lang, LLM.SYSTEM_PROMPTS["en"])
 
-        # Dynamic check: Use parameter if provided, otherwise fetch from Spaces Variables
-        resolved_provider = provider or os.getenv("LLM_PROVIDER", "gemini").lower()
+        # Hardwired to Gemini (gemma-4-26b-a4b-it) for infrastructure testing.
+        # To switch to GGUF, comment out the Gemini block and
+        # uncomment the GGUF block beneath it.
 
-        if resolved_provider == "gemini":
-            gemini_api = os.getenv("GEMINI_API_KEY")
-            if not gemini_api:
-                raise ValueError("GEMINI_API_KEY is missing from environment secrets.")
-            return GeminiStrategy(
-                api_key=gemini_api,
-                system_prompt=prompt
-            )
+        # --- GEMINI (active) ---
+        gemini_api = os.getenv("GEMINI_API_KEY")
+        if not gemini_api:
+            raise ValueError("GEMINI_API_KEY is missing from environment secrets.")
+        return GeminiStrategy(
+            api_key=gemini_api,
+            system_prompt=prompt
+        )
 
-        elif resolved_provider in ["qwen", "gguf", "local"]:
-            local_path = os.getenv("LOCAL_MODEL_PATH")
-            return GGUFStrategy(
-                model_path=local_path,
-                system_prompt=prompt
-            )
-
-        raise ValueError(f"Unsupported LLM provider configuration: '{resolved_provider}'")
+        # --- GGUF / local (inactive) ---
+        # from llmModule.GGUFStrategy import GGUFStrategy
+        # local_path = os.getenv("LOCAL_MODEL_PATH")
+        # if not local_path:
+        #     raise ValueError("LOCAL_MODEL_PATH is missing from environment secrets.")
+        # return GGUFStrategy(
+        #     model_path=local_path,
+        #     system_prompt=prompt
+        # )
