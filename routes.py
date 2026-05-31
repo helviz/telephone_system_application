@@ -161,8 +161,8 @@ def dashboard():
 
 @app.route("/dashboard/calls", methods=["GET"])
 def dashboard_calls():
-    s = stats.snapshot()["calls"]
-    active = s["active"]
+    s = stats.get_cached("calls_snap")
+    active = s.get("active", [])
     html = """
     <div class="section">
         <h2>Call Metrics</h2>
@@ -198,7 +198,7 @@ def dashboard_calls():
 
 @app.route("/dashboard/latency", methods=["GET"])
 def dashboard_latency():
-    lat = stats.get_latencies()
+    lat = stats.get_cached("latency")
 
     def fmt(v):
         return f"{v}s" if v is not None else "—"
@@ -225,7 +225,7 @@ def dashboard_latency():
 
 @app.route("/dashboard/models", methods=["GET"])
 def dashboard_models():
-    m = stats.model_info
+    m = stats.get_cached("models")
     tts_langs = ", ".join(m["tts_languages"]) if m["tts_languages"] else "—"
     preload_status = "✅ OK" if m["preload_ok"] else "⚠️ fallback / pending"
     preload_dur = f"{m['preload_duration_s']}s" if m["preload_duration_s"] else "—"
@@ -258,7 +258,7 @@ def dashboard_models():
 
 @app.route("/dashboard/resources", methods=["GET"])
 def dashboard_resources():
-    r = stats.get_system_resources()
+    r = stats.get_cached("resources")
 
     # Warn when cgroup read failed and we fell back to host-level psutil
     scope_warning = ""
@@ -310,7 +310,8 @@ def dashboard_resources():
 
 @app.route("/dashboard/concurrency", methods=["GET"])
 def dashboard_concurrency():
-    tts_c = stats.tts_lock_contention
+    c = stats.get_cached("concurrency")
+    tts_c = c.get("tts_contention", {})
 
     html = """
     <div class="section">
@@ -326,9 +327,9 @@ def dashboard_concurrency():
         </table>
     </div>
     """.format(
-        active=len(stats.active_calls),
-        peak=stats.peak_concurrent,
-        whisper_q=stats.whisper_queue_depth,
+        active=c.get("active_count", 0),
+        peak=c.get("peak_concurrent", 0),
+        whisper_q=c.get("whisper_queue", 0),
         tts_en=tts_c.get("en", 0),
         tts_fr=tts_c.get("fr", 0),
         tts_sw=tts_c.get("sw", 0),
@@ -344,6 +345,10 @@ def dashboard_concurrency():
 def metrics():
     import json
     return Response(json.dumps(stats.snapshot(), indent=2), mimetype="application/json")
+
+
+# snapshot() still computes fresh for /metrics (used for debugging/monitoring)
+# — only the HTMX dashboard fragments use the cache
 
 
 # ===========================================================================

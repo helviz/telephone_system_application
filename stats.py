@@ -1,3 +1,15 @@
+"""
+stats.py — shared in-process state for the dashboard.
+
+Imported by:
+  - sockets.py   → writes call connect/disconnect/latency events
+  - routes.py    → reads for dashboard fragment rendering
+
+All fields are plain Python types (int, float, dict) so reads are
+effectively atomic on CPython's GIL. No locking needed for the dashboard
+polling use case.
+"""
+
 import time
 import os
 import psutil
@@ -170,53 +182,71 @@ def _read_cgroup_memory() -> tuple[float | None, float | None]:
     return None, None
 
 
-def _read_cgroup_cpu() -> float | None:
+# ---------------------------------------------------------------------------
+# CPU sampling state — maintained by the background thread
+# _cpu_ns_last holds the previous cgroup reading so the thread can compute
+# delta without sleeping; it samples every STATS_INTERVAL seconds instead.
+# ---------------------------------------------------------------------------
+_cpu_ns_last: int | None = None
+_cpu_ns_last_wall: float = 0.0
+
+
+def _read_cpu_usage_ns() -> int | None:
+    """Read cumulative container CPU nanoseconds from cgroup (v2 then v1)."""
+    # cgroup v2
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1]) * 1000   # µs → ns
+    except Exception:
+        pass
+    # cgroup v1
+    try:
+        with open("/sys/fs/cgroup/cpuacct/cpuacct.usage") as f:
+            return int(f.read().strip())
+    except Exception:
+        pass
+    return None
+
+
+def _sample_cpu_delta() -> float | None:
     """
-    Compute container CPU usage % from cgroup acct files.
-    Takes two samples 250ms apart and returns the delta as a percentage
-    of one logical CPU. Returns None if cgroup CPU accounting is unavailable.
+    Non-blocking CPU % estimate using two consecutive calls to this function.
+    The first call seeds _cpu_ns_last; subsequent calls compute the delta
+    over the elapsed wall time since the last sample.
+    Called exclusively by the background stats thread — never on a request.
     """
-    import time
+    global _cpu_ns_last, _cpu_ns_last_wall
 
-    def _read_cpu_usage_ns() -> int | None:
-        # cgroup v2
-        try:
-            with open("/sys/fs/cgroup/cpu.stat") as f:
-                for line in f:
-                    if line.startswith("usage_usec"):
-                        return int(line.split()[1]) * 1000  # us -> ns
-        except Exception:
-            pass
-        # cgroup v1
-        try:
-            with open("/sys/fs/cgroup/cpuacct/cpuacct.usage") as f:
-                return int(f.read().strip())
-        except Exception:
-            pass
+    now_ns   = _read_cpu_usage_ns()
+    now_wall = time.monotonic()
+
+    if now_ns is None:
         return None
 
-    t0 = _read_cpu_usage_ns()
-    if t0 is None:
+    if _cpu_ns_last is None:
+        # First call — seed the baseline, return None (no delta yet)
+        _cpu_ns_last      = now_ns
+        _cpu_ns_last_wall = now_wall
         return None
 
-    wall0 = time.monotonic()
-    time.sleep(0.25)
-    t1 = _read_cpu_usage_ns()
-    wall1 = time.monotonic()
+    cpu_ns  = now_ns   - _cpu_ns_last
+    wall_ns = (now_wall - _cpu_ns_last_wall) * 1e9
 
-    if t1 is None:
+    _cpu_ns_last      = now_ns
+    _cpu_ns_last_wall = now_wall
+
+    if wall_ns <= 0:
         return None
-
-    cpu_ns  = t1 - t0
-    wall_ns = (wall1 - wall0) * 1e9
     return round(cpu_ns / wall_ns * 100, 1)
 
 
 def get_system_resources() -> dict:
     """
-    Returns container-scoped RAM and CPU by reading cgroup files directly.
-    Falls back to psutil host-level values if cgroup is unavailable, but
-    sets scoped=False so the dashboard can warn the user.
+    Returns container-scoped RAM and CPU.
+    CPU is computed via delta between successive calls (no sleep).
+    Falls back to psutil if cgroup files are unavailable.
     """
     result = {
         "ram_used_gb":  None,
@@ -226,7 +256,7 @@ def get_system_resources() -> dict:
         "gpu_used_mb":  None,
         "gpu_total_mb": None,
         "gpu_pct":      None,
-        "scoped":       True,   # False = fell back to host-level psutil
+        "scoped":       True,
     }
 
     # RAM
@@ -243,13 +273,14 @@ def get_system_resources() -> dict:
         result["ram_pct"]      = mem.percent
         result["scoped"]       = False
 
-    # CPU
-    cpu = _read_cgroup_cpu()
+    # CPU — use cached delta from background thread if available
+    cpu = _sample_cpu_delta()
     if cpu is not None:
         result["cpu_pct"] = cpu
     else:
         result["cpu_pct"] = psutil.cpu_percent(interval=None)
-        result["scoped"]  = False
+        if _read_cpu_usage_ns() is None:
+            result["scoped"] = False
 
     # GPU
     try:
@@ -264,6 +295,71 @@ def get_system_resources() -> dict:
         pass
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Background stats loop
+# Runs in a daemon thread. Recomputes all stats once per STATS_INTERVAL
+# seconds and caches pre-built result dicts. Dashboard routes read the cache
+# instantly — zero blocking, zero sleep on request threads.
+# ---------------------------------------------------------------------------
+
+STATS_INTERVAL = 1.0   # seconds between full recomputes
+
+_stats_cache: dict = {}   # last computed snapshot per section
+
+
+def _build_cache():
+    """Recompute every stats section and store in _stats_cache."""
+    global _stats_cache
+    _stats_cache = {
+        "resources":   get_system_resources(),
+        "latency":     get_latencies(),
+        "calls_snap":  {
+            "active":          list(active_calls.values()),
+            "active_count":    len(active_calls),
+            "total":           total_calls,
+            "failed":          failed_calls,
+            "peak_concurrent": peak_concurrent,
+            "avg_duration_s":  avg_call_duration(),
+            "by_lang":         dict(calls_by_lang),
+            "by_provider":     dict(calls_by_provider),
+        },
+        "concurrency": {
+            "active_count":    len(active_calls),
+            "peak_concurrent": peak_concurrent,
+            "whisper_queue":   whisper_queue_depth,
+            "tts_contention":  dict(tts_lock_contention),
+        },
+        "models": dict(model_info),
+    }
+
+
+def _stats_loop():
+    """Background daemon thread — runs forever, rebuilds cache every second."""
+    while True:
+        try:
+            _build_cache()
+        except Exception as e:
+            print(f"[stats] background loop error: {e}")
+        time.sleep(STATS_INTERVAL)
+
+
+def get_cached(section: str) -> dict:
+    """Return the last cached value for a section, or recompute if not ready."""
+    if not _stats_cache:
+        _build_cache()
+    return _stats_cache.get(section, {})
+
+
+def _start_background_loop():
+    import threading
+    t = threading.Thread(target=_stats_loop, daemon=True, name="stats-loop")
+    t.start()
+
+
+# Start immediately on import so the cache is warm before the first request
+_start_background_loop()
 
 
 def snapshot() -> dict:
