@@ -1,3 +1,4 @@
+import asyncio
 from google import genai
 from google.genai import types
 from llmModule.LLMStrategy import LLMStrategy
@@ -19,13 +20,31 @@ class GeminiStrategy(LLMStrategy):
         )
 
     async def generate_stream(self, user_input: str):
+        """
+        FIX 1: send_message_stream() is a blocking call that iterates a
+        synchronous generator. Running it directly inside an async generator
+        blocks the event loop for the entire duration of the response,
+        freezing all other coroutines (STT, WebSocket receiver, etc.).
+
+        Solution: collect all chunks in a thread via run_in_executor, then
+        yield them back on the event loop. This keeps the loop free during
+        the blocking network I/O.
+        """
         print("AI: ", end="", flush=True)
 
-        response = self.chat.send_message_stream(user_input)
+        loop = asyncio.get_running_loop()
 
-        for chunk in response:
-            if chunk.text:
-                print(chunk.text, end="", flush=True)
-                yield chunk.text
+        def _collect_chunks() -> list[str]:
+            chunks = []
+            for chunk in self.chat.send_message_stream(user_input):
+                if chunk.text:
+                    print(chunk.text, end="", flush=True)
+                    chunks.append(chunk.text)
+            return chunks
+
+        chunks = await loop.run_in_executor(None, _collect_chunks)
+
+        for chunk in chunks:
+            yield chunk
 
         print("\n")
