@@ -260,7 +260,23 @@ def dashboard_models():
 def dashboard_resources():
     r = stats.get_system_resources()
 
-    gpu_rows = ""
+    # Warn when cgroup read failed and we fell back to host-level psutil
+    scope_warning = ""
+    if not r.get("scoped", True):
+        scope_warning = (
+            "<tr><td colspan='2' style='color:orange'>"
+            "⚠️ cgroup unavailable — showing host-level figures, not container"
+            "</td></tr>"
+        )
+
+    ram_total = r["ram_total_gb"]
+    ram_pct   = r["ram_pct"]
+    ram_str   = (
+        f"{r['ram_used_gb']} GB / {ram_total} GB ({ram_pct}%)"
+        if ram_total else
+        f"{r['ram_used_gb']} GB (limit unknown)"
+    )
+
     if r["gpu_total_mb"] is not None:
         gpu_rows = """
             <tr><td>GPU VRAM used</td><td>{used} MB / {total} MB ({pct}%)</td></tr>
@@ -274,18 +290,18 @@ def dashboard_resources():
 
     html = """
     <div class="section">
-        <h2>System Resources</h2>
+        <h2>System Resources <small>(container-scoped)</small></h2>
         <table>
             <tr><th>Resource</th><th>Value</th></tr>
-            <tr><td>RAM used</td><td>{ram_used} GB / {ram_total} GB ({ram_pct}%)</td></tr>
+            {scope_warning}
+            <tr><td>RAM used</td><td>{ram_str}</td></tr>
             {gpu_rows}
             <tr><td>CPU usage</td><td>{cpu}%</td></tr>
         </table>
     </div>
     """.format(
-        ram_used=r["ram_used_gb"],
-        ram_total=r["ram_total_gb"],
-        ram_pct=r["ram_pct"],
+        scope_warning=scope_warning,
+        ram_str=ram_str,
         gpu_rows=gpu_rows,
         cpu=r["cpu_pct"],
     )
