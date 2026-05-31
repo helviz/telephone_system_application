@@ -1,6 +1,7 @@
 import base64
 import audioop
 import json
+import asyncio
 import torch
 import numpy as np
 from Audio.AudioOutput import AudioOutput
@@ -9,10 +10,21 @@ from Audio.AudioOutput import AudioOutput
 class PhoneAudioOutput(AudioOutput):
     """
     Handles audio output for both Twilio and Telnyx websocket streams.
-    Both platforms use the same mu-law encoding over websocket media events.
+
+    FIX: The original implementation sent media events without a streamSid.
+    Twilio requires every outbound media message to include the streamSid
+    (received in the 'start' event) otherwise it drops the audio silently.
+
+    The source (PhoneStreamSource) captures the streamSid — we accept it
+    here via set_stream_sid() which sockets.py calls after the start event
+    is received.
+
+    Also adds a 'mark' event after each audio chunk so Twilio can sequence
+    playback correctly and detect when the assistant has finished speaking.
     """
 
     PROVIDERS = {"twilio", "telnyx"}
+    _mark_counter = 0
 
     def __init__(self, websocket, provider: str = "twilio"):
         if provider not in self.PROVIDERS:
@@ -20,6 +32,11 @@ class PhoneAudioOutput(AudioOutput):
 
         self.ws = websocket
         self.provider = provider
+        self.stream_sid: str | None = None
+
+    def set_stream_sid(self, sid: str):
+        """Called by sockets.py once the 'start' event is received."""
+        self.stream_sid = sid
 
     async def send_audio(self, audio, sample_rate=16000):
         # Handle tensor input
@@ -38,10 +55,26 @@ class PhoneAudioOutput(AudioOutput):
         # Encode base64
         payload = base64.b64encode(mulaw).decode("utf-8")
 
-        await self.ws.send_text(json.dumps({
+        # Build the media message — include streamSid for Twilio
+        media_msg: dict = {
             "event": "media",
-            "media": {"payload": payload}
-        }))
+            "media": {"payload": payload},
+        }
+        if self.stream_sid:
+            media_msg["streamSid"] = self.stream_sid
+
+        await self.ws.send_text(json.dumps(media_msg))
+
+        # Send a mark event so Twilio knows this chunk finished playing
+        PhoneAudioOutput._mark_counter += 1
+        mark_msg: dict = {
+            "event": "mark",
+            "mark":  {"name": f"chunk_{PhoneAudioOutput._mark_counter}"},
+        }
+        if self.stream_sid:
+            mark_msg["streamSid"] = self.stream_sid
+
+        await self.ws.send_text(json.dumps(mark_msg))
 
     @classmethod
     def twilio(cls, websocket) -> "PhoneAudioOutput":
@@ -50,13 +83,3 @@ class PhoneAudioOutput(AudioOutput):
     @classmethod
     def telnyx(cls, websocket) -> "PhoneAudioOutput":
         return cls(websocket, provider="telnyx")
-
-
-# # Twilio
-# output = PhoneAudioOutput.twilio(websocket)
-#
-# # Telnyx
-# output = PhoneAudioOutput.telnyx(websocket)
-#
-# # Or directly
-# output = PhoneAudioOutput(websocket, provider="twilio")
