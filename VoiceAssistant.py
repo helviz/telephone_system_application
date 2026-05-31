@@ -5,6 +5,19 @@ from tts.TTSModule import TTSModule
 
 
 class VoiceAssistant:
+    """
+    FIX 4: The original start() spawned a new asyncio.Task for every
+    transcribed utterance without cancelling the previous one. If the caller
+    spoke again while the assistant was still generating audio, two (or more)
+    LLM→TTS pipelines ran concurrently, producing overlapping audio and
+    wasting compute.
+
+    Fix: keep a reference to the single active handle_text task. When a new
+    utterance arrives, cancel the in-flight task first (barge-in behaviour),
+    then start a fresh one. CancelledError is suppressed inside handle_text
+    so the cancellation is clean.
+    """
+
     def __init__(
         self,
         source,
@@ -21,24 +34,22 @@ class VoiceAssistant:
         self.lang   = lang
         self.source = source
 
-        # STT — reuse preloaded WhisperModel if available
         self.stt = STTModule(
             model_size="small",
             lang=self.lang,
             preloaded_model=preloaded_whisper,
         )
 
-        # LLM — GGUF singleton is already warm if provider=qwen
         self.llm = LLM.get_model(provider=provider, lang=self.lang)
 
-        # TTS — pass preloaded models so no disk I/O happens mid-call
         self.audio_output = output
         self.tts = TTSModule(
             output=self.audio_output,
             preloaded_models=preloaded_tts,
         )
 
-        self._tasks: list[asyncio.Task] = []
+        # FIX 4: single active task slot instead of a growing list
+        self._active_task: asyncio.Task | None = None
 
     async def handle_text(self, text: str):
         try:
@@ -46,20 +57,30 @@ class VoiceAssistant:
             llm_stream = self.llm.generate_stream(text)
             await self.tts.speak_stream(llm_stream, lang=self.lang)
         except asyncio.CancelledError:
-            pass
+            # Barge-in: caller spoke while we were responding — clean exit
+            print(f"[VoiceAssistant] 🔇 Barge-in detected — response cancelled.")
         except Exception as e:
             print(f"[VoiceAssistant] Pipeline error: {e}")
+
+    async def _cancel_active(self):
+        """Cancel the in-flight LLM→TTS task and wait for it to finish."""
+        if self._active_task and not self._active_task.done():
+            self._active_task.cancel()
+            try:
+                await self._active_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._active_task = None
 
     async def start(self):
         print(f"--- Voice Assistant Active [{self.lang.upper()}] ---")
         try:
             async for text in self.stt.transcribe_stream(self.source):
                 if text.strip():
-                    task = asyncio.create_task(self.handle_text(text))
-                    self._tasks.append(task)
-                    self._tasks = [t for t in self._tasks if not t.done()]
+                    # FIX 4: cancel whatever is playing before starting a new response
+                    await self._cancel_active()
+                    self._active_task = asyncio.create_task(self.handle_text(text))
         except Exception as e:
             print(f"[VoiceAssistant] Error: {e}")
         finally:
-            for task in self._tasks:
-                task.cancel()
+            await self._cancel_active()
