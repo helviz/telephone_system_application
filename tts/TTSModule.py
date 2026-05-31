@@ -1,3 +1,4 @@
+import asyncio
 import time
 import torch
 from transformers import VitsModel, AutoTokenizer
@@ -110,11 +111,23 @@ class TTSModule:
             await self._generate_audio(buffer.strip(), model, tokenizer, on_first_audio=cb)
 
     async def _generate_audio(self, text, model, tokenizer, on_first_audio=None):
-        t0 = time.time()
-        inputs = tokenizer(text, return_tensors="pt").to(self.device)
+        """
+        Offload tokenization + inference to a thread so the event loop stays
+        free to receive WebSocket audio chunks and run the STT pipeline while
+        TTS is synthesizing. On CPU this can take 2-5s per sentence — blocking
+        the loop here is what caused audio not playing and logs only appearing
+        after hangup.
+        """
+        loop = asyncio.get_running_loop()
+        t0   = time.time()
 
-        with torch.inference_mode():
-            waveform = model(**inputs).waveform
+        def _synthesize():
+            inputs = tokenizer(text, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                waveform = model(**inputs).waveform
+            return waveform
+
+        waveform = await loop.run_in_executor(None, _synthesize)
 
         tts_elapsed = time.time() - t0
         try:
