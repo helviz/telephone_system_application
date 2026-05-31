@@ -93,12 +93,24 @@ def _load_models():
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # LLM — GGUF singleton (only when LLM_PROVIDER=qwen/gguf/local)
+    # LLM — ask LLM.get_model() what strategy it will actually use,
+    # then preload only if that strategy is GGUF. This means the env var
+    # LLM_PROVIDER no longer drives preload — the factory does, so
+    # hardwiring LLM.py to GeminiStrategy skips GGUF loading automatically.
     # ------------------------------------------------------------------
-    llm_provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+    from llmModule.LLM import LLM
+    from llmModule.GGUFStrategy import GGUFStrategy
 
-    if llm_provider in ("qwen", "gguf", "local"):
-        print("📦 [3/3] Loading GGUF LLM ...")
+    print("📦 [3/3] Detecting active LLM strategy ...")
+    try:
+        probe = LLM.get_model(lang="en")
+        active_strategy = type(probe).__name__
+    except Exception as e:
+        print(f"   ❌ Could not instantiate LLM strategy: {e}")
+        sys.exit(1)
+
+    if isinstance(probe, GGUFStrategy):
+        print(f"   Strategy: {active_strategy} — preloading GGUF model ...")
         t = time.time()
         try:
             from llmModule.GGUFStrategy import _get_llm
@@ -108,7 +120,7 @@ def _load_models():
             print(f"   ❌ GGUF LLM failed: {e}")
             sys.exit(1)
     else:
-        print(f"📦 [3/3] LLM provider [{llm_provider}] — skipping GGUF preload.\n")
+        print(f"   Strategy: {active_strategy} — no local model to preload. Skipping.\n")
 
     elapsed = time.time() - total_start
     print("=" * 60)
@@ -121,8 +133,8 @@ def _load_models():
         "whisper_size":       os.getenv("WHISPER_MODEL_SIZE", "medium"),
         "whisper_device":     os.getenv("WHISPER_DEVICE", "cpu"),
         "tts_languages":      list(_preloaded_tts.keys()),
-        "llm_provider":       os.getenv("LLM_PROVIDER", "gemini"),
-        "llm_model":          "gemma-4-26b-a4b-it",
+        "llm_provider":       active_strategy,
+        "llm_model":          getattr(probe, "model_name", active_strategy),
         "preload_ok":         True,
         "preload_duration_s": round(elapsed, 1),
     })
