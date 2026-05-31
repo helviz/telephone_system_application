@@ -1,8 +1,9 @@
 import os
-from flask import Flask, request, Response, abort
+from flask import Flask, request, Response, abort, render_template_string
 from twilio.twiml.voice_response import VoiceResponse, Connect, Gather, Say
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
+import stats
 
 load_dotenv()
 
@@ -11,7 +12,6 @@ app = Flask(__name__)
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 VALIDATE_TWILIO = os.getenv("VALIDATE_TWILIO_SIGNATURE", "true").lower() == "true"
 
-# Maps DTMF digit → (language code, human-readable name)
 LANG_MAP = {
     "1": ("en", "English"),
     "2": ("fr", "French"),
@@ -32,15 +32,10 @@ IVR_INVALID = (
 
 
 def _public_host() -> str:
-    """
-    Returns the public hostname (no scheme).
-    Reads PUBLIC_HOST from .env; falls back to request.host for local dev.
-    """
     return os.getenv("PUBLIC_HOST") or request.host
 
 
 def _validate_twilio():
-    """Abort 403 if Twilio signature validation is enabled and fails."""
     if VALIDATE_TWILIO and TWILIO_AUTH_TOKEN:
         validator = RequestValidator(TWILIO_AUTH_TOKEN)
         if not validator.validate(
@@ -52,29 +47,307 @@ def _validate_twilio():
 
 
 # ===========================================================================
+# DASHBOARD — shell page (served once, HTMX loads sections independently)
+# ===========================================================================
+
+DASHBOARD_SHELL = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Voice Assistant — System Dashboard</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        body { font-family: monospace; margin: 0; display: flex; height: 100vh; }
+
+        /* Sidebar nav */
+        #sidebar {
+            width: 180px;
+            flex-shrink: 0;
+            border-right: 1px solid #ccc;
+            padding: 1rem 0;
+        }
+        #sidebar a {
+            display: block;
+            padding: 0.5rem 1rem;
+            text-decoration: none;
+            color: inherit;
+        }
+        #sidebar a:hover { background: #f0f0f0; }
+
+        /* Main content area */
+        #main {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        /* Each section */
+        .section {
+            border: 1px solid #ccc;
+            margin-bottom: 1rem;
+            padding: 1rem;
+        }
+        .section h2 { margin: 0 0 0.75rem 0; font-size: 1rem; }
+
+        /* Generic table inside sections */
+        table { border-collapse: collapse; width: 100%; }
+        td, th { padding: 0.25rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }
+        th { font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<nav id="sidebar">
+    <strong style="padding: 0.5rem 1rem; display:block;">Dashboard</strong>
+    <a href="#section-calls">Call Metrics</a>
+    <a href="#section-latency">Pipeline Latency</a>
+    <a href="#section-models">Model Health</a>
+    <a href="#section-resources">System Resources</a>
+    <a href="#section-concurrency">Concurrency</a>
+</nav>
+
+<div id="main">
+
+    <div id="section-calls"
+         hx-get="/dashboard/calls"
+         hx-trigger="load, every 2s"
+         hx-swap="innerHTML">
+        Loading call metrics...
+    </div>
+
+    <div id="section-latency"
+         hx-get="/dashboard/latency"
+         hx-trigger="load, every 2s"
+         hx-swap="innerHTML">
+        Loading latency...
+    </div>
+
+    <div id="section-models"
+         hx-get="/dashboard/models"
+         hx-trigger="load, every 10s"
+         hx-swap="innerHTML">
+        Loading model info...
+    </div>
+
+    <div id="section-resources"
+         hx-get="/dashboard/resources"
+         hx-trigger="load, every 2s"
+         hx-swap="innerHTML">
+        Loading system resources...
+    </div>
+
+    <div id="section-concurrency"
+         hx-get="/dashboard/concurrency"
+         hx-trigger="load, every 2s"
+         hx-swap="innerHTML">
+        Loading concurrency info...
+    </div>
+
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET"])
+def dashboard():
+    return render_template_string(DASHBOARD_SHELL)
+
+
+# ===========================================================================
+# DASHBOARD FRAGMENTS — each returns a bare <div class="section"> block
+# ===========================================================================
+
+@app.route("/dashboard/calls", methods=["GET"])
+def dashboard_calls():
+    s = stats.snapshot()["calls"]
+    active = s["active"]
+    html = """
+    <div class="section">
+        <h2>Call Metrics</h2>
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Active calls</td><td>{active_count}</td></tr>
+            <tr><td>&nbsp;&nbsp;↳ Twilio</td><td>{twilio_active}</td></tr>
+            <tr><td>&nbsp;&nbsp;↳ Telnyx</td><td>{telnyx_active}</td></tr>
+            <tr><td>Total calls (since start)</td><td>{total}</td></tr>
+            <tr><td>Failed / dropped</td><td>{failed}</td></tr>
+            <tr><td>Peak concurrent</td><td>{peak}</td></tr>
+            <tr><td>Avg call duration</td><td>{avg_dur}</td></tr>
+            <tr><td>Calls by language</td><td>en={en} fr={fr} sw={sw}</td></tr>
+            <tr><td>Calls by provider</td><td>Twilio={twilio} Telnyx={telnyx}</td></tr>
+        </table>
+    </div>
+    """.format(
+        active_count=s["active_count"],
+        twilio_active=sum(1 for c in active if c["provider"] == "twilio"),
+        telnyx_active=sum(1 for c in active if c["provider"] == "telnyx"),
+        total=s["total"],
+        failed=s["failed"],
+        peak=s["peak_concurrent"],
+        avg_dur=f"{s['avg_duration_s']}s" if s["avg_duration_s"] else "—",
+        en=s["by_lang"].get("en", 0),
+        fr=s["by_lang"].get("fr", 0),
+        sw=s["by_lang"].get("sw", 0),
+        twilio=s["by_provider"].get("twilio", 0),
+        telnyx=s["by_provider"].get("telnyx", 0),
+    )
+    return html
+
+
+@app.route("/dashboard/latency", methods=["GET"])
+def dashboard_latency():
+    lat = stats.get_latencies()
+
+    def fmt(v):
+        return f"{v}s" if v is not None else "—"
+
+    html = """
+    <div class="section">
+        <h2>Pipeline Latency <small>(rolling avg, last 20)</small></h2>
+        <table>
+            <tr><th>Stage</th><th>Avg Latency</th></tr>
+            <tr><td>STT (audio → transcript)</td><td>{stt}</td></tr>
+            <tr><td>LLM (transcript → first token)</td><td>{llm}</td></tr>
+            <tr><td>TTS (first token → first audio)</td><td>{tts}</td></tr>
+            <tr><td>End-to-end</td><td>{e2e}</td></tr>
+        </table>
+    </div>
+    """.format(
+        stt=fmt(lat["stt_avg_s"]),
+        llm=fmt(lat["llm_avg_s"]),
+        tts=fmt(lat["tts_avg_s"]),
+        e2e=fmt(lat["e2e_avg_s"]),
+    )
+    return html
+
+
+@app.route("/dashboard/models", methods=["GET"])
+def dashboard_models():
+    m = stats.model_info
+    tts_langs = ", ".join(m["tts_languages"]) if m["tts_languages"] else "—"
+    preload_status = "✅ OK" if m["preload_ok"] else "⚠️ fallback / pending"
+    preload_dur = f"{m['preload_duration_s']}s" if m["preload_duration_s"] else "—"
+
+    html = """
+    <div class="section">
+        <h2>Model Health</h2>
+        <table>
+            <tr><th>Item</th><th>Value</th></tr>
+            <tr><td>Whisper model size</td><td>{whisper_size}</td></tr>
+            <tr><td>Whisper device</td><td>{whisper_device}</td></tr>
+            <tr><td>TTS languages loaded</td><td>{tts_langs}</td></tr>
+            <tr><td>LLM provider</td><td>{llm_provider}</td></tr>
+            <tr><td>LLM model</td><td>{llm_model}</td></tr>
+            <tr><td>Preload status</td><td>{preload_status}</td></tr>
+            <tr><td>Preload duration</td><td>{preload_dur}</td></tr>
+        </table>
+    </div>
+    """.format(
+        whisper_size=m["whisper_size"],
+        whisper_device=m["whisper_device"],
+        tts_langs=tts_langs,
+        llm_provider=m["llm_provider"],
+        llm_model=m["llm_model"],
+        preload_status=preload_status,
+        preload_dur=preload_dur,
+    )
+    return html
+
+
+@app.route("/dashboard/resources", methods=["GET"])
+def dashboard_resources():
+    r = stats.get_system_resources()
+
+    gpu_rows = ""
+    if r["gpu_total_mb"] is not None:
+        gpu_rows = """
+            <tr><td>GPU VRAM used</td><td>{used} MB / {total} MB ({pct}%)</td></tr>
+        """.format(
+            used=r["gpu_used_mb"],
+            total=r["gpu_total_mb"],
+            pct=r["gpu_pct"],
+        )
+    else:
+        gpu_rows = "<tr><td>GPU VRAM</td><td>— (CPU only)</td></tr>"
+
+    html = """
+    <div class="section">
+        <h2>System Resources</h2>
+        <table>
+            <tr><th>Resource</th><th>Value</th></tr>
+            <tr><td>RAM used</td><td>{ram_used} GB / {ram_total} GB ({ram_pct}%)</td></tr>
+            {gpu_rows}
+            <tr><td>CPU usage</td><td>{cpu}%</td></tr>
+        </table>
+    </div>
+    """.format(
+        ram_used=r["ram_used_gb"],
+        ram_total=r["ram_total_gb"],
+        ram_pct=r["ram_pct"],
+        gpu_rows=gpu_rows,
+        cpu=r["cpu_pct"],
+    )
+    return html
+
+
+@app.route("/dashboard/concurrency", methods=["GET"])
+def dashboard_concurrency():
+    tts_c = stats.tts_lock_contention
+
+    html = """
+    <div class="section">
+        <h2>Concurrency</h2>
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Active calls</td><td>{active}</td></tr>
+            <tr><td>Peak concurrent calls</td><td>{peak}</td></tr>
+            <tr><td>Whisper queue depth</td><td>{whisper_q}</td></tr>
+            <tr><td>TTS contention — en</td><td>{tts_en}</td></tr>
+            <tr><td>TTS contention — fr</td><td>{tts_fr}</td></tr>
+            <tr><td>TTS contention — sw</td><td>{tts_sw}</td></tr>
+        </table>
+    </div>
+    """.format(
+        active=len(stats.active_calls),
+        peak=stats.peak_concurrent,
+        whisper_q=stats.whisper_queue_depth,
+        tts_en=tts_c.get("en", 0),
+        tts_fr=tts_c.get("fr", 0),
+        tts_sw=tts_c.get("sw", 0),
+    )
+    return html
+
+
+# ===========================================================================
+# Raw JSON endpoint (for debugging / external monitoring)
+# ===========================================================================
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    import json
+    return Response(json.dumps(stats.snapshot(), indent=2), mimetype="application/json")
+
+
+# ===========================================================================
 # TWILIO
 # ===========================================================================
 
 @app.route("/twilio/voice", methods=["POST"])
 def twilio_voice():
-    """
-    Step 1 — Twilio calls this on inbound call.
-    Plays the IVR menu and waits for a single DTMF digit.
-    """
     _validate_twilio()
 
     resp = VoiceResponse()
     gather = Gather(
         num_digits=1,
-        action="/twilio/language",   # Step 2
+        action="/twilio/language",
         method="POST",
         timeout=10,
-        finish_on_key="",            # Don't need # — single digit is enough
+        finish_on_key="",
     )
     gather.say(IVR_GREETING)
     resp.append(gather)
-
-    # If the caller doesn't press anything, replay the menu
     resp.redirect("/twilio/voice", method="POST")
 
     return Response(str(resp), mimetype="text/xml")
@@ -82,18 +355,12 @@ def twilio_voice():
 
 @app.route("/twilio/language", methods=["POST"])
 def twilio_language():
-    """
-    Step 2 — Twilio posts the pressed digit here.
-    Validates it, then connects the Media Stream with the chosen language
-    embedded in the WebSocket URL path.
-    """
     _validate_twilio()
 
     digit = request.form.get("Digits", "")
     host  = _public_host()
 
     if digit not in LANG_MAP:
-        # Invalid key — replay the IVR menu
         resp = VoiceResponse()
         gather = Gather(
             num_digits=1,
@@ -112,7 +379,6 @@ def twilio_language():
 
     resp = VoiceResponse()
     connect = Connect()
-    # Language is passed in the URL so the WebSocket handler knows it immediately
     connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}")
     resp.append(connect)
 
@@ -125,10 +391,6 @@ def twilio_language():
 
 @app.route("/telnyx/voice", methods=["POST"])
 def telnyx_voice():
-    """
-    Step 1 — Telnyx calls this on inbound call.
-    Plays the IVR menu and waits for a single DTMF digit via TeXML <Gather>.
-    """
     host = _public_host()
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -142,10 +404,6 @@ def telnyx_voice():
 
 @app.route("/telnyx/language", methods=["POST"])
 def telnyx_language():
-    """
-    Step 2 — Telnyx posts the pressed digit here.
-    Validates it, then opens a Media Stream with the chosen language in the URL.
-    """
     digit = request.form.get("Digits", "")
     host  = _public_host()
 

@@ -12,6 +12,7 @@ from routes import app as flask_app
 from VoiceAssistant import VoiceAssistant
 from Audio.PhoneStreamSource import PhoneStreamSource
 from Audio.PhoneAudioOutput import PhoneAudioOutput
+import stats
 
 load_dotenv()
 
@@ -109,10 +110,22 @@ def _load_models():
     else:
         print(f"📦 [3/3] LLM provider [{llm_provider}] — skipping GGUF preload.\n")
 
+    elapsed = time.time() - total_start
     print("=" * 60)
-    print(f"✅ ALL MODELS READY — {time.time()-total_start:.1f}s total")
+    print(f"✅ ALL MODELS READY — {elapsed:.1f}s total")
     print("🚀 Handing off to uvicorn...\n")
     print("=" * 60 + "\n")
+
+    # Write model metadata into the shared stats store
+    stats.model_info.update({
+        "whisper_size":       os.getenv("WHISPER_MODEL_SIZE", "medium"),
+        "whisper_device":     os.getenv("WHISPER_DEVICE", "cpu"),
+        "tts_languages":      list(_preloaded_tts.keys()),
+        "llm_provider":       os.getenv("LLM_PROVIDER", "gemini"),
+        "llm_model":          "gemma-4-26b-a4b-it",
+        "preload_ok":         True,
+        "preload_duration_s": round(elapsed, 1),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +157,9 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
         return
 
     await websocket.accept()
+
+    session_id = f"{provider}:{id(websocket)}"
+    stats.call_started(session_id, provider, lang)
 
     print("\n" + "=" * 60)
     print(f"   INBOUND CALL CONNECTED")
@@ -189,6 +205,7 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
             except (asyncio.CancelledError, Exception):
                 pass
     finally:
+        stats.call_ended(session_id)
         print(f"[{provider.upper()}] Session cleaned up.\n")
 
 
