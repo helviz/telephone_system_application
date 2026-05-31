@@ -5,7 +5,7 @@ from llmModule.LLMStrategy import LLMStrategy
 
 
 class GeminiStrategy(LLMStrategy):
-    def __init__(self, api_key: str, system_prompt: str, model_name="gemini-2.0-flash-lite"):
+    def __init__(self, api_key: str, system_prompt: str, model_name="gemma-4-26b-a4b-it"):
         super().__init__(system_prompt)
 
         self.client = genai.Client(api_key=api_key)
