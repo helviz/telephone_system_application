@@ -1,4 +1,5 @@
 import asyncio
+import time
 import numpy as np
 from faster_whisper import WhisperModel
 from Audio.AudioSource import AudioSource
@@ -84,9 +85,18 @@ class STTModule:
                     if rms < 0.01:
                         continue
 
+                    t0 = time.time()
                     texts = await loop.run_in_executor(
                         None, self._transcribe_blocking, audio_data
                     )
+                    stt_elapsed = time.time() - t0
+
+                    if texts:
+                        try:
+                            import stats
+                            stats.record_stt_latency(stt_elapsed)
+                        except Exception:
+                            pass
 
                     for text in texts:
                         yield text

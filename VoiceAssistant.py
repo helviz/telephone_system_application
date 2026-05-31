@@ -1,4 +1,6 @@
 import asyncio
+import time
+import stats
 from llmModule.LLM import LLM
 from transcribe.SSTModule import STTModule
 from tts.TTSModule import TTSModule
@@ -54,8 +56,32 @@ class VoiceAssistant:
     async def handle_text(self, text: str):
         try:
             print(f"--- Processing [{self.lang}]: {text} ---")
+
+            # LLM latency: time from transcript arriving to first token yielded
+            t_transcript = time.time()
+            _llm_measured = False
+
             llm_stream = self.llm.generate_stream(text)
-            await self.tts.speak_stream(llm_stream, lang=self.lang)
+
+            async def _measured_llm_stream():
+                nonlocal _llm_measured
+                async for chunk in llm_stream:
+                    if not _llm_measured:
+                        stats.record_llm_latency(time.time() - t_transcript)
+                        _llm_measured = True
+                    yield chunk
+
+            # E2E latency: from transcript to first audio chunk sent to caller
+            t_e2e = t_transcript
+
+            def _on_first_audio():
+                stats.record_e2e_latency(time.time() - t_e2e)
+
+            await self.tts.speak_stream(
+                _measured_llm_stream(),
+                lang=self.lang,
+                on_first_audio=_on_first_audio,
+            )
         except asyncio.CancelledError:
             # Barge-in: caller spoke while we were responding — clean exit
             print(f"[VoiceAssistant] 🔇 Barge-in detected — response cancelled.")

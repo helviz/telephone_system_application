@@ -1,3 +1,4 @@
+import time
 import torch
 from transformers import VitsModel, AutoTokenizer
 
@@ -57,13 +58,14 @@ class TTSModule:
 
         print(f"[TTS] Loaded {lang} on {self.device}")
 
-    async def speak_stream(self, text_generator, lang="en"):
+    async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
         if lang not in self.models:
             self.load_language(lang)
 
-        model     = self.models[lang]
-        tokenizer = self.tokenizers[lang]
-        buffer    = ""
+        model      = self.models[lang]
+        tokenizer  = self.tokenizers[lang]
+        buffer     = ""
+        _first_audio_fired = False
 
         async for chunk in text_generator:
             buffer += chunk
@@ -72,7 +74,11 @@ class TTSModule:
             if any(p in chunk for p in [".", "!", "?", "\n"]):
                 sentence = buffer.strip()
                 if sentence:
-                    await self._generate_audio(sentence, model, tokenizer)
+                    cb = None
+                    if not _first_audio_fired and on_first_audio:
+                        cb = on_first_audio
+                        _first_audio_fired = True
+                    await self._generate_audio(sentence, model, tokenizer, on_first_audio=cb)
                 buffer = ""
 
             # FIX 3 — Secondary flush trigger: buffer too long, no punctuation yet.
@@ -89,16 +95,35 @@ class TTSModule:
                     buffer   = ""
 
                 if sentence:
-                    await self._generate_audio(sentence, model, tokenizer)
+                    cb = None
+                    if not _first_audio_fired and on_first_audio:
+                        cb = on_first_audio
+                        _first_audio_fired = True
+                    await self._generate_audio(sentence, model, tokenizer, on_first_audio=cb)
 
         # Drain whatever remains after the LLM stream closes
         if buffer.strip():
-            await self._generate_audio(buffer.strip(), model, tokenizer)
+            cb = None
+            if not _first_audio_fired and on_first_audio:
+                cb = on_first_audio
+                _first_audio_fired = True
+            await self._generate_audio(buffer.strip(), model, tokenizer, on_first_audio=cb)
 
-    async def _generate_audio(self, text, model, tokenizer):
+    async def _generate_audio(self, text, model, tokenizer, on_first_audio=None):
+        t0 = time.time()
         inputs = tokenizer(text, return_tensors="pt").to(self.device)
 
         with torch.inference_mode():
             waveform = model(**inputs).waveform
+
+        tts_elapsed = time.time() - t0
+        try:
+            import stats
+            stats.record_tts_latency(tts_elapsed)
+        except Exception:
+            pass
+
+        if on_first_audio:
+            on_first_audio()
 
         await self.output.send_audio(waveform, sample_rate=model.config.sampling_rate)
