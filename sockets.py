@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -177,7 +178,8 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
     print(f"   INBOUND CALL CONNECTED")
     print(f"   Provider:   {provider.upper()}")
     print(f"   Language:   {lang.upper()}")
-    print(f"   LLM Engine: {LLM_PROVIDER.upper()}")
+    _llm_label = stats.model_info.get("llm_provider", LLM_PROVIDER)
+    print(f"   LLM Engine: {_llm_label.upper()}")
     print("=" * 60 + "\n")
 
     source = PhoneStreamSource(provider=provider)
@@ -197,6 +199,12 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
             while True:
                 message = await websocket.receive_text()
                 await source.add_data(message)
+
+                # Forward streamSid to output as soon as source captures it
+                # from Twilio's 'start' event. No-op once set.
+                if source.stream_sid and not output.stream_sid:
+                    output.set_stream_sid(source.stream_sid)
+
         except WebSocketDisconnect:
             print(f"\n❌ [{provider.upper()}] Caller hung up")
         except Exception as e:
@@ -223,9 +231,33 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
 
 fastapi_app.mount("/", WSGIMiddleware(flask_app))
 
+class _DashboardFilter(logging.Filter):
+    """
+    Drop uvicorn access log records for /dashboard/* and /metrics routes.
+    These are polled every 1-2s by the browser and produce hundreds of
+    log lines per minute that bury actual call activity.
+    """
+    _SUPPRESSED = ("/dashboard/", "/metrics")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(path in msg for path in self._SUPPRESSED)
+
+
+def _configure_logging():
+    """Attach the dashboard filter to uvicorn's access logger."""
+    logging.getLogger("uvicorn.access").addFilter(_DashboardFilter())
+
+
+# Call at module level so the filter is active when HF Spaces launches
+# uvicorn externally (the __main__ block won't run in that case).
+_configure_logging()
+
+
 if __name__ == "__main__":
     import uvicorn
 
+    _configure_logging()
     port = int(os.getenv("PORT", 7860))
     print(f"Starting voice assistant on port {port}...")
     uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
