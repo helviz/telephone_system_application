@@ -46,20 +46,13 @@ COPY . .
 
 RUN chmod +x /app/start.sh
 
-# ── Pre-cache all TTS + Whisper models at build time ────────────────────────
-# This bakes the models into the image so there are zero network fetches
-# during a live call — avoids mid-call NetworkError on HF Spaces.
-RUN python3 -c "\
-from transformers import VitsModel, AutoTokenizer; \
-models = ['facebook/mms-tts-eng', 'facebook/mms-tts-fra', 'facebook/mms-tts-swh']; \
-[AutoTokenizer.from_pretrained(m) or VitsModel.from_pretrained(m) for m in models]; \
-print('TTS models cached.')"
+# ── Environment Configuration for Free Tier ──────────
+# Define a local cache directory that Hugging Face can read/write smoothly.
+ENV HF_HOME=/app/.cache
+RUN mkdir -p /app/.cache
 
-RUN python3 -c "\
-from faster_whisper import WhisperModel; \
-WhisperModel('small', device='cpu', compute_type='int8'); \
-print('Whisper small cached.')"
-
+# Expose the standard port used by Hugging Face Spaces
 EXPOSE 7860
 
-CMD ["bash", "./start.sh"]
+# Run the startup script
+CMD ["/app/start.sh"]
