@@ -21,19 +21,19 @@ class VoiceAssistant:
     """
 
     def __init__(
-        self,
-        source,
-        output,
-        provider="gemini",
-        lang="en",
-        preloaded_tts: dict = None,
-        preloaded_whisper=None,
+            self,
+            source,
+            output,
+            provider="gemini",
+            lang="en",
+            preloaded_tts: dict = None,
+            preloaded_whisper=None,
     ):
         allowed_langs = ["en", "fr", "sw"]
         if lang not in allowed_langs:
             raise ValueError(f"Unsupported language: {lang}. Choose from {allowed_langs}")
 
-        self.lang   = lang
+        self.lang = lang
         self.source = source
 
         self.stt = STTModule(
@@ -45,38 +45,37 @@ class VoiceAssistant:
         self.llm = LLM.get_model(provider=provider, lang=self.lang)
 
         self.audio_output = output
+
+        # Pass the preloaded_tts dict safely. TTSModule handles the lazy-loading fallback
+        # seamlessly if this dictionary comes in empty from sockets.py.
         self.tts = TTSModule(
             output=self.audio_output,
-            preloaded_models=preloaded_tts,
+            preloaded_models=preloaded_tts
         )
 
-        # FIX 4: single active task slot instead of a growing list
         self._active_task: asyncio.Task | None = None
 
     async def handle_text(self, text: str):
+        print(f"[User]: {text}")
+        t_e2e = time.time()
+
         try:
-            print(f"--- Processing [{self.lang}]: {text} ---")
-
-            # LLM latency: time from transcript arriving to first token yielded
-            t_transcript = time.time()
-            _llm_measured = False
-
-            llm_stream = self.llm.generate_stream(text)
+            # Gather stream responses from LLM layer
+            llm_stream = await self.llm.generate_stream(text)
 
             async def _measured_llm_stream():
-                nonlocal _llm_measured
+                _first = True
                 async for chunk in llm_stream:
-                    if not _llm_measured:
-                        stats.record_llm_latency(time.time() - t_transcript)
-                        _llm_measured = True
+                    if _first:
+                        stats.record_llm_latency(time.time() - t_e2e)
+                        _first = False
                     yield chunk
-
-            # E2E latency: from transcript to first audio chunk sent to caller
-            t_e2e = t_transcript
 
             def _on_first_audio():
                 stats.record_e2e_latency(time.time() - t_e2e)
 
+            # Modified: Send the active language context downstream so TTSModule
+            # knows exactly which weights to allocate in RAM if it hasn't cached them yet.
             await self.tts.speak_stream(
                 _measured_llm_stream(),
                 lang=self.lang,
