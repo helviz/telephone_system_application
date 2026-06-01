@@ -3,35 +3,22 @@ import time
 import torch
 from transformers import VitsModel, AutoTokenizer
 
-# Flush the buffer when it exceeds this many characters even without punctuation.
-# Prevents indefinite blocking on LLM outputs that lack sentence-ending marks
-# (e.g. bullet lists, code snippets, single-word answers).
 MAX_BUFFER_CHARS = 200
 
 
 class TTSModule:
-    """
-    FIX 3: The original speak_stream() only flushed the buffer when a
-    sentence-ending punctuation character (. ! ? \\n) appeared in a chunk.
-    LLM responses that contain no punctuation — lists, code, numbers, short
-    factual replies — would accumulate indefinitely in the buffer and only
-    play after the entire LLM stream finished, adding large perceived latency.
-
-    Fix: add a MAX_BUFFER_CHARS hard limit. When the buffer grows beyond that
-    threshold we flush at the nearest word boundary (split on the last space)
-    so we never cut a word in half mid-synthesis.
-    """
-
     def __init__(self, output, preloaded_models: dict = None):
         self.output = output
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # Safe map tracking Hugging Face Model Hub repositories
         self.model_map = {
             "en": "facebook/mms-tts-eng",
             "fr": "facebook/mms-tts-fra",
             "sw": "facebook/mms-tts-swh",
         }
 
+        # Keep these empty at startup to preserve precious Free Space memory!
         self.models = {}
         self.tokenizers = {}
 
@@ -39,70 +26,58 @@ class TTSModule:
             for lang, (model, tokenizer) in preloaded_models.items():
                 self.models[lang] = model
                 self.tokenizers[lang] = tokenizer
-            print(f"[TTS] Using preloaded models for: {list(preloaded_models.keys())}")
-        else:
-            print("[TTS] No preloaded models supplied — loading all languages now...")
-            for lang in self.model_map:
-                self.load_language(lang)
-            print("[TTS] All language models ready.")
 
-    def load_language(self, lang="en"):
-        if lang not in self.model_map:
-            raise ValueError(f"Unsupported language: {lang}")
+    def _ensure_model_loaded(self, lang: str):
+        """
+        Dynamically extracts and allocates weights only when a phone call
+        actively requests a specific language block.
+        """
+        if lang not in self.models:
+            print(
+                f"\n[TTS] 🧠 Free Space Optimization: Lazy loading model weights for language context: [{lang.upper()}]...")
+            t_load = time.time()
 
-        model_name = self.model_map[lang]
-        print(f"[TTS] Loading model: {model_name}")
+            repo_id = self.model_map[lang]
+            self.tokenizers[lang] = AutoTokenizer.from_pretrained(repo_id)
+            self.models[lang] = VitsModel.from_pretrained(repo_id).to(self.device)
 
-        self.tokenizers[lang] = AutoTokenizer.from_pretrained(model_name)
-        self.models[lang] = VitsModel.from_pretrained(model_name).to(self.device)
-        self.models[lang].eval()
+            print(f"[TTS] Successfully allocated memory for [{lang.upper()}] in {time.time() - t_load:.2f}s.\n")
 
-        print(f"[TTS] Loaded {lang} on {self.device}")
+        return self.models[lang], self.tokenizers[lang]
 
     async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
-        if lang not in self.models:
-            self.load_language(lang)
+        # Dynamically ensure the specific model is loaded without touching the other 2 languages
+        model, tokenizer = self._ensure_model_loaded(lang)
 
-        model      = self.models[lang]
-        tokenizer  = self.tokenizers[lang]
-        buffer     = ""
+        buffer = ""
         _first_audio_fired = False
 
         async for chunk in text_generator:
             buffer += chunk
 
-            # Primary flush trigger: sentence-ending punctuation
-            if any(p in chunk for p in [".", "!", "?", "\n"]):
-                sentence = buffer.strip()
-                if sentence:
-                    cb = None
-                    if not _first_audio_fired and on_first_audio:
-                        cb = on_first_audio
-                        _first_audio_fired = True
-                    await self._generate_audio(sentence, model, tokenizer, on_first_audio=cb)
-                buffer = ""
-
-            # FIX 3 — Secondary flush trigger: buffer too long, no punctuation yet.
-            # Flush at the last word boundary to avoid cutting words mid-synthesis.
-            elif len(buffer) >= MAX_BUFFER_CHARS:
-                last_space = buffer.rfind(" ")
-                if last_space != -1:
-                    # Synthesise everything up to the last complete word
-                    sentence = buffer[:last_space].strip()
-                    buffer   = buffer[last_space + 1:]   # carry the partial word forward
+            # Sentence splitting logic
+            if any(p in chunk for p in [".", "!", "?", "\n"]) or len(buffer) >= MAX_BUFFER_CHARS:
+                if len(buffer) >= MAX_BUFFER_CHARS:
+                    # Flush safely at closest word boundary
+                    split_idx = buffer.rfind(" ")
+                    if split_idx != -1:
+                        to_say = buffer[:split_idx].strip()
+                        buffer = buffer[split_idx:].strip()
+                    else:
+                        to_say = buffer.strip()
+                        buffer = ""
                 else:
-                    # No space found — the whole buffer is one giant token; flush as-is
-                    sentence = buffer.strip()
-                    buffer   = ""
+                    to_say = buffer.strip()
+                    buffer = ""
 
-                if sentence:
+                if to_say:
                     cb = None
                     if not _first_audio_fired and on_first_audio:
                         cb = on_first_audio
                         _first_audio_fired = True
-                    await self._generate_audio(sentence, model, tokenizer, on_first_audio=cb)
+                    await self._generate_audio(to_say, model, tokenizer, on_first_audio=cb)
 
-        # Drain whatever remains after the LLM stream closes
+        # Drain remaining content
         if buffer.strip():
             cb = None
             if not _first_audio_fired and on_first_audio:
@@ -111,15 +86,8 @@ class TTSModule:
             await self._generate_audio(buffer.strip(), model, tokenizer, on_first_audio=cb)
 
     async def _generate_audio(self, text, model, tokenizer, on_first_audio=None):
-        """
-        Offload tokenization + inference to a thread so the event loop stays
-        free to receive WebSocket audio chunks and run the STT pipeline while
-        TTS is synthesizing. On CPU this can take 2-5s per sentence — blocking
-        the loop here is what caused audio not playing and logs only appearing
-        after hangup.
-        """
         loop = asyncio.get_running_loop()
-        t0   = time.time()
+        t0 = time.time()
 
         def _synthesize():
             inputs = tokenizer(text, return_tensors="pt").to(self.device)
