@@ -5,6 +5,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.wsgi import WSGIMiddleware
 from dotenv import load_dotenv
@@ -27,118 +28,42 @@ _preloaded_whisper       = None
 
 
 def _load_models():
-    """
-    Runs synchronously at startup, before the event loop starts accepting
-    connections. Mirrors preload.py but populates module-level variables in
-    THIS process so they are visible to every WebSocket session.
-    """
     global _preloaded_tts, _preloaded_whisper
 
     print("\n" + "=" * 60)
-    print("🔥 PRELOADING ALL MODELS — server will start after this")
+    print("🔥 INITIALIZING COMPACT SERVICE PROFILE — HUGGING FACE FREE TIER")
     print("=" * 60 + "\n")
 
     total_start = time.time()
 
     # ------------------------------------------------------------------
-    # STT — Faster-Whisper
+    # STT — Faster-Whisper (Load this immediately)
     # ------------------------------------------------------------------
-    print("📦 [1/3] Loading Faster-Whisper ...")
+    print("📦 [1/2] Loading Faster-Whisper...")
     t = time.time()
-    try:
-        from faster_whisper import WhisperModel
+    from faster_whisper import WhisperModel
+    import os
 
-        whisper_device     = os.getenv("WHISPER_DEVICE", "cpu").strip()
-        whisper_model_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
-        compute_type       = "float16" if whisper_device == "cuda" else "int8"
+    resolved_size = os.getenv("WHISPER_MODEL_SIZE", "small").strip()
+    resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if resolved_device == "cuda" else "int8"
 
-        _preloaded_whisper = WhisperModel(
-            whisper_model_size,
-            device=whisper_device,
-            compute_type=compute_type,
-            download_root=os.getenv("HF_HOME"),
-        )
-        print(f"   ✅ Whisper [{whisper_model_size}] on [{whisper_device}] — {time.time()-t:.1f}s\n")
-    except Exception as e:
-        print(f"   ❌ Whisper failed: {e}")
-        sys.exit(1)
+    _preloaded_whisper = WhisperModel(
+        resolved_size,
+        device=resolved_device,
+        compute_type=compute_type,
+        download_root=os.getenv("HF_HOME")
+    )
+    print(f"✅ Whisper loaded in {time.time() - t:.2f}s")
 
     # ------------------------------------------------------------------
-    # TTS — Facebook MMS-TTS (en / fr / sw)
+    # TTS — Kept Empty for Lazy Evaluation
     # ------------------------------------------------------------------
-    print("📦 [2/3] Loading MMS-TTS models (en / fr / sw) ...")
-    t = time.time()
-    try:
-        import torch
-        from transformers import VitsModel, AutoTokenizer
+    print("📦 [2/2] TTS Language Array Initialized [Deferred Mode]...")
+    _preloaded_tts = {}  # Leave empty! TTSModule will handle loading per-call.
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        tts_models = {
-            "en": "facebook/mms-tts-eng",
-            "fr": "facebook/mms-tts-fra",
-            "sw": "facebook/mms-tts-swh",
-        }
-
-        for lang, model_name in tts_models.items():
-            lt = time.time()
-            print(f"   Loading {lang} → {model_name} ...")
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model     = VitsModel.from_pretrained(model_name).to(device)
-            model.eval()
-            _preloaded_tts[lang] = (model, tokenizer)
-            print(f"   ✅ {lang} ready — {time.time()-lt:.1f}s")
-
-        print(f"   ✅ All TTS models on [{device}] — {time.time()-t:.1f}s\n")
-    except Exception as e:
-        print(f"   ❌ TTS failed: {e}")
-        sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # LLM — ask LLM.get_model() what strategy it will actually use,
-    # then preload only if that strategy is GGUF. This means the env var
-    # LLM_PROVIDER no longer drives preload — the factory does, so
-    # hardwiring LLM.py to GeminiStrategy skips GGUF loading automatically.
-    # ------------------------------------------------------------------
-    from llmModule.LLM import LLM
-    from llmModule.GGUFStrategy import GGUFStrategy
-
-    print("📦 [3/3] Detecting active LLM strategy ...")
-    try:
-        probe = LLM.get_model(lang="en")
-        active_strategy = type(probe).__name__
-    except Exception as e:
-        print(f"   ❌ Could not instantiate LLM strategy: {e}")
-        sys.exit(1)
-
-    if isinstance(probe, GGUFStrategy):
-        print(f"   Strategy: {active_strategy} — preloading GGUF model ...")
-        t = time.time()
-        try:
-            from llmModule.GGUFStrategy import _get_llm
-            _get_llm()
-            print(f"   ✅ GGUF LLM ready — {time.time()-t:.1f}s\n")
-        except Exception as e:
-            print(f"   ❌ GGUF LLM failed: {e}")
-            sys.exit(1)
-    else:
-        print(f"   Strategy: {active_strategy} — no local model to preload. Skipping.\n")
-
-    elapsed = time.time() - total_start
-    print("=" * 60)
-    print(f"✅ ALL MODELS READY — {elapsed:.1f}s total")
-    print("🚀 Handing off to uvicorn...\n")
+    print(f"\n🚀 System initialized successfully in {time.time() - total_start:.2f}s! Ready for inbound audio traffic.")
     print("=" * 60 + "\n")
-
-    # Write model metadata into the shared stats store
-    stats.model_info.update({
-        "whisper_size":       os.getenv("WHISPER_MODEL_SIZE", "medium"),
-        "whisper_device":     os.getenv("WHISPER_DEVICE", "cpu"),
-        "tts_languages":      list(_preloaded_tts.keys()),
-        "llm_provider":       active_strategy,
-        "llm_model":          getattr(probe, "model_name", active_strategy),
-        "preload_ok":         True,
-        "preload_duration_s": round(elapsed, 1),
-    })
 
 
 # ---------------------------------------------------------------------------
