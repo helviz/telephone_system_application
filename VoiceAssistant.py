@@ -61,7 +61,7 @@ class VoiceAssistant:
 
         try:
             # Gather stream responses from LLM layer
-            llm_stream = await self.llm.generate_stream(text)
+            llm_stream = self.llm.generate_stream(text)
 
             async def _measured_llm_stream():
                 _first = True
