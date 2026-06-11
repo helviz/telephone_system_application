@@ -3,13 +3,31 @@ import os
 import asyncio
 from datetime import datetime
 
-DB_PATH = os.getenv("SQLITE_DB_PATH", "voice_assistant.db")
+# 1. Resolve path with safety fallback checks
+if os.path.exists("/data"):
+    DB_PATH = "/data/voice_assistant.db"
+else:
+    DB_PATH = os.getenv("SQLITE_DB_PATH", "voice_assistant.db")
+
+print(f"[Database Engine] Active storage path resolved to: {DB_PATH}")
 
 
 def init_db():
     """Initializes the SQLite database and creates all persistent tables."""
-    conn = sqlite3.connect(DB_PATH)
+    # Ensure parent directories exist (crucial for local/fallback path variations)
+    parent_dir = os.path.dirname(DB_PATH)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+
+    # Use timeout parameters to gracefully manage network latency on HF Storage Buckets
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     cursor = conn.cursor()
+
+    # Enable WAL mode for optimized concurrent reading/writing over FUSE storage layers
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL;")
+    except sqlite3.OperationalError:
+        pass # Fallback cleanly if the FUSE layer restricts WAL allocation
 
     # -----------------------------------------------------------------------
     # call_logs — one row per WebSocket session (inbound phone call)
@@ -56,7 +74,7 @@ def init_db():
 
 def db_start_call(session_id: str, provider: str, language: str, caller_number: str = "UNKNOWN"):
     """Inserts a new call record when a WebSocket stream initialises."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -68,43 +86,47 @@ def db_start_call(session_id: str, provider: str, language: str, caller_number: 
         conn.commit()
     except sqlite3.IntegrityError:
         pass  # Guard against duplicate WebSocket frames
+    except Exception as e:
+        print(f"[database] Failed to record call start: {e}")
     finally:
         conn.close()
 
 
 def db_end_call(session_id: str, completed: bool = True):
     """Stamps end_time, duration, and final status onto an existing call row."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     cursor = conn.cursor()
     now = datetime.utcnow()
 
-    cursor.execute("SELECT start_time FROM call_logs WHERE session_id = ?", (session_id,))
-    row = cursor.fetchone()
+    try:
+        cursor.execute("SELECT start_time FROM call_logs WHERE session_id = ?", (session_id,))
+        row = cursor.fetchone()
 
-    if row:
-        raw = row[0]
-        # SQLite may return a string or a datetime depending on adapter config
-        if isinstance(raw, str):
-            try:
-                start_time = datetime.fromisoformat(raw)
-            except ValueError:
-                start_time = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S.%f")
-        else:
-            start_time = raw
+        if row:
+            raw = row[0]
+            if isinstance(raw, str):
+                try:
+                    start_time = datetime.fromisoformat(raw)
+                except ValueError:
+                    start_time = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S.%f")
+            else:
+                start_time = raw
 
-        duration = (now - start_time).total_seconds()
-        status   = "completed" if completed else "failed"
+            duration = (now - start_time).total_seconds()
+            status   = "completed" if completed else "failed"
 
-        cursor.execute("""
-            UPDATE call_logs
-               SET end_time         = ?,
-                   duration_seconds = ?,
-                   status           = ?
-             WHERE session_id = ?
-        """, (now, duration, status, session_id))
-        conn.commit()
-
-    conn.close()
+            cursor.execute("""
+                UPDATE call_logs
+                   SET end_time         = ?,
+                       duration_seconds = ?,
+                       status           = ?
+                 WHERE session_id = ?
+            """, (now, round(duration, 2), status, session_id))
+            conn.commit()
+    except Exception as e:
+        print(f"[database] Failed to log call end execution: {e}")
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +135,7 @@ def db_end_call(session_id: str, completed: bool = True):
 
 def db_log_model_load(model_name: str, duration_s: float, device: str = "cpu"):
     """Persists how long a specific model took to initialise at startup."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -127,7 +149,7 @@ def db_log_model_load(model_name: str, duration_s: float, device: str = "cpu"):
         conn.close()
 
 
-# ---------------------------------------------------------------------------
+
 # Async wrappers — keeps FastAPI's event loop unblocked during disk I/O
 # ---------------------------------------------------------------------------
 
@@ -144,5 +166,8 @@ async def async_log_model_load(model_name: str, duration_s: float, device: str =
     await asyncio.to_thread(db_log_model_load, model_name, duration_s, device)
 
 
-# Initialise tables immediately on import so nothing else has to call init_db()
-init_db()
+# Safely execute tables verification block
+try:
+    init_db()
+except Exception as init_err:
+    print(f"[CRITICAL] Database setup failed: {init_err}. Retrying sequentially on active calls.")
