@@ -46,9 +46,8 @@ def _validate_twilio():
             abort(403, description="Invalid Twilio signature")
 
 
-# ===========================================================================
+
 # DASHBOARD — shell page (served once, HTMX loads sections independently)
-# ===========================================================================
 
 DASHBOARD_SHELL = """
 <!DOCTYPE html>
@@ -155,9 +154,9 @@ def dashboard():
     return render_template_string(DASHBOARD_SHELL)
 
 
-# ===========================================================================
+ 
 # DASHBOARD FRAGMENTS — each returns a bare <div class="section"> block
-# ===========================================================================
+ 
 
 @app.route("/dashboard/calls", methods=["GET"])
 def dashboard_calls():
@@ -337,9 +336,9 @@ def dashboard_concurrency():
     return html
 
 
-# ===========================================================================
+ 
 # Raw JSON endpoint (for debugging / external monitoring)
-# ===========================================================================
+ 
 
 @app.route("/metrics", methods=["GET"])
 def metrics():
@@ -351,9 +350,9 @@ def metrics():
 # — only the HTMX dashboard fragments use the cache
 
 
-# ===========================================================================
+ 
 # TWILIO
-# ===========================================================================
+ 
 
 @app.route("/twilio/voice", methods=["POST"])
 def twilio_voice():
@@ -400,15 +399,18 @@ def twilio_language():
 
     resp = VoiceResponse()
     connect = Connect()
-    connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}")
+    # Pass the caller's E.164 number as a query param so the WebSocket
+    # handler can record it in the persistent call_logs table.
+    caller = request.form.get("From", "UNKNOWN")
+    connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}")
     resp.append(connect)
 
     return Response(str(resp), mimetype="text/xml")
 
 
-# ===========================================================================
+ 
 # TELNYX
-# ===========================================================================
+ 
 
 @app.route("/telnyx/voice", methods=["POST"])
 def telnyx_voice():
@@ -441,16 +443,17 @@ def telnyx_language():
     lang, lang_name = LANG_MAP[digit]
     print(f"[Telnyx IVR] Caller selected: {lang_name} ({lang})")
 
+    caller = request.form.get("From", "UNKNOWN")
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Stream url="wss://{host}/media-stream/telnyx/{lang}" />
+    <Stream url="wss://{host}/media-stream/telnyx/{lang}?From={caller}" />
 </Response>"""
     return Response(texml, mimetype="text/xml")
 
 
-# ===========================================================================
+ 
 # Health check
-# ===========================================================================
+ 
 
 @app.route("/health", methods=["GET"])
 def health():
