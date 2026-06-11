@@ -1,25 +1,12 @@
-"""
-stats.py — shared in-process state for the dashboard.
-
-Imported by:
-  - sockets.py   → writes call connect/disconnect/latency events
-  - routes.py    → reads for dashboard fragment rendering
-
-All fields are plain Python types (int, float, dict) so reads are
-effectively atomic on CPython's GIL. No locking needed for the dashboard
-polling use case.
-"""
-
 import time
 import os
 import psutil
+import database
 
 
-# ---------------------------------------------------------------------------
 # Call tracking
-# ---------------------------------------------------------------------------
 
-# { session_id: {"provider": str, "lang": str, "started_at": float} }
+# { session_id: {"provider": str, "lang": str, "caller": str, "started_at": float} }
 active_calls: dict[str, dict] = {}
 
 total_calls: int = 0
@@ -37,33 +24,27 @@ calls_by_lang: dict[str, int] = {"en": 0, "fr": 0, "sw": 0}
 calls_by_provider: dict[str, int] = {"twilio": 0, "telnyx": 0}
 
 
-# ---------------------------------------------------------------------------
 # Pipeline latency (rolling average over last 20 measurements)
-# ---------------------------------------------------------------------------
-
 _WINDOW = 20
 
-_stt_latencies:  list[float] = []
-_llm_latencies:  list[float] = []
-_tts_latencies:  list[float] = []
-_e2e_latencies:  list[float] = []
+_stt_latencies: list[float] = []
+_llm_latencies: list[float] = []
+_tts_latencies: list[float] = []
+_e2e_latencies: list[float] = []
 
 
 def _rolling_avg(samples: list[float]) -> float | None:
     return round(sum(samples) / len(samples), 3) if samples else None
 
 
-# ---------------------------------------------------------------------------
 # Model info — written once by sockets.py lifespan after preload completes
-# ---------------------------------------------------------------------------
-
 model_info: dict = {
     "whisper_size":       os.getenv("WHISPER_MODEL_SIZE", "medium"),
     "whisper_device":     os.getenv("WHISPER_DEVICE", "cpu"),
     "tts_languages":      [],          # populated after preload
     "llm_provider":       os.getenv("LLM_PROVIDER", "gemini"),
     "llm_model":          "gemma-4-26b-a4b-it",
-    "preload_ok":         False,       # set True by lifespan on success
+    "preload_ok":         False,
     "preload_duration_s": None,
 }
 
@@ -72,16 +53,20 @@ whisper_queue_depth: int = 0
 tts_lock_contention: dict[str, int] = {"en": 0, "fr": 0, "sw": 0}
 
 
-# ---------------------------------------------------------------------------
 # Public write API — called by sockets.py
-# ---------------------------------------------------------------------------
-
-def call_started(session_id: str, provider: str, lang: str):
+def call_started(session_id: str, provider: str, lang: str,
+                 caller_number: str = "UNKNOWN"):
+    """
+    Record a new inbound call in the live stats dict AND persist it to SQLite.
+    caller_number should be the E.164 phone number from Twilio/Telnyx, or
+    'UNKNOWN' when the provider doesn't supply it.
+    """
     global total_calls, peak_concurrent
 
     active_calls[session_id] = {
         "provider":   provider,
         "lang":       lang,
+        "caller":     caller_number,
         "started_at": time.time(),
     }
 
@@ -92,8 +77,15 @@ def call_started(session_id: str, provider: str, lang: str):
     if len(active_calls) > peak_concurrent:
         peak_concurrent = len(active_calls)
 
+    # Persist to SQLite (non-blocking; errors are logged inside database.py)
+    database.db_start_call(session_id, provider, lang, caller_number)
+
 
 def call_ended(session_id: str, failed: bool = False):
+    """
+    Finalise an active call in the live stats dict AND write duration/status
+    to the persistent SQLite record.
+    """
     global failed_calls, _total_duration_seconds, _completed_calls
 
     call = active_calls.pop(session_id, None)
@@ -101,6 +93,8 @@ def call_ended(session_id: str, failed: bool = False):
         duration = time.time() - call["started_at"]
         _total_duration_seconds += duration
         _completed_calls += 1
+        # Persist end timestamp + duration
+        database.db_end_call(session_id, completed=not failed)
 
     if failed:
         failed_calls += 1
@@ -130,10 +124,7 @@ def record_e2e_latency(seconds: float):
         _e2e_latencies.pop(0)
 
 
-# ---------------------------------------------------------------------------
 # Public read API — called by dashboard routes
-# ---------------------------------------------------------------------------
-
 def avg_call_duration() -> float | None:
     if _completed_calls == 0:
         return None
@@ -142,10 +133,10 @@ def avg_call_duration() -> float | None:
 
 def get_latencies() -> dict:
     return {
-        "stt_avg_s":  _rolling_avg(_stt_latencies),
-        "llm_avg_s":  _rolling_avg(_llm_latencies),
-        "tts_avg_s":  _rolling_avg(_tts_latencies),
-        "e2e_avg_s":  _rolling_avg(_e2e_latencies),
+        "stt_avg_s": _rolling_avg(_stt_latencies),
+        "llm_avg_s": _rolling_avg(_llm_latencies),
+        "tts_avg_s": _rolling_avg(_tts_latencies),
+        "e2e_avg_s": _rolling_avg(_e2e_latencies),
     }
 
 
@@ -155,7 +146,6 @@ def _read_cgroup_memory() -> tuple[float | None, float | None]:
     Tries cgroup v2 paths first, falls back to cgroup v1.
     Returns (used_bytes, limit_bytes) or (None, None) if unavailable.
     """
-    # cgroup v2
     try:
         with open("/sys/fs/cgroup/memory.current") as f:
             used = int(f.read().strip())
@@ -166,13 +156,11 @@ def _read_cgroup_memory() -> tuple[float | None, float | None]:
     except Exception:
         pass
 
-    # cgroup v1
     try:
         with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
             used = int(f.read().strip())
         with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
             limit = int(f.read().strip())
-        # v1 reports a huge sentinel (~2^63) when no limit is set
         if limit > 2 ** 60:
             limit = None
         return used, limit
@@ -182,26 +170,18 @@ def _read_cgroup_memory() -> tuple[float | None, float | None]:
     return None, None
 
 
-# ---------------------------------------------------------------------------
-# CPU sampling state — maintained by the background thread
-# _cpu_ns_last holds the previous cgroup reading so the thread can compute
-# delta without sleeping; it samples every STATS_INTERVAL seconds instead.
-# ---------------------------------------------------------------------------
 _cpu_ns_last: int | None = None
 _cpu_ns_last_wall: float = 0.0
 
 
 def _read_cpu_usage_ns() -> int | None:
-    """Read cumulative container CPU nanoseconds from cgroup (v2 then v1)."""
-    # cgroup v2
     try:
         with open("/sys/fs/cgroup/cpu.stat") as f:
             for line in f:
                 if line.startswith("usage_usec"):
-                    return int(line.split()[1]) * 1000   # µs → ns
+                    return int(line.split()[1]) * 1000
     except Exception:
         pass
-    # cgroup v1
     try:
         with open("/sys/fs/cgroup/cpuacct/cpuacct.usage") as f:
             return int(f.read().strip())
@@ -211,12 +191,6 @@ def _read_cpu_usage_ns() -> int | None:
 
 
 def _sample_cpu_delta() -> float | None:
-    """
-    Non-blocking CPU % estimate using two consecutive calls to this function.
-    The first call seeds _cpu_ns_last; subsequent calls compute the delta
-    over the elapsed wall time since the last sample.
-    Called exclusively by the background stats thread — never on a request.
-    """
     global _cpu_ns_last, _cpu_ns_last_wall
 
     now_ns   = _read_cpu_usage_ns()
@@ -226,7 +200,6 @@ def _sample_cpu_delta() -> float | None:
         return None
 
     if _cpu_ns_last is None:
-        # First call — seed the baseline, return None (no delta yet)
         _cpu_ns_last      = now_ns
         _cpu_ns_last_wall = now_wall
         return None
@@ -243,11 +216,6 @@ def _sample_cpu_delta() -> float | None:
 
 
 def get_system_resources() -> dict:
-    """
-    Returns container-scoped RAM and CPU.
-    CPU is computed via delta between successive calls (no sleep).
-    Falls back to psutil if cgroup files are unavailable.
-    """
     result = {
         "ram_used_gb":  None,
         "ram_total_gb": None,
@@ -259,7 +227,6 @@ def get_system_resources() -> dict:
         "scoped":       True,
     }
 
-    # RAM
     used_bytes, limit_bytes = _read_cgroup_memory()
     if used_bytes is not None:
         result["ram_used_gb"] = round(used_bytes / 1024 ** 3, 2)
@@ -273,7 +240,6 @@ def get_system_resources() -> dict:
         result["ram_pct"]      = mem.percent
         result["scoped"]       = False
 
-    # CPU — use cached delta from background thread if available
     cpu = _sample_cpu_delta()
     if cpu is not None:
         result["cpu_pct"] = cpu
@@ -282,7 +248,6 @@ def get_system_resources() -> dict:
         if _read_cpu_usage_ns() is None:
             result["scoped"] = False
 
-    # GPU
     try:
         import torch
         if torch.cuda.is_available():
@@ -297,25 +262,18 @@ def get_system_resources() -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
 # Background stats loop
-# Runs in a daemon thread. Recomputes all stats once per STATS_INTERVAL
-# seconds and caches pre-built result dicts. Dashboard routes read the cache
-# instantly — zero blocking, zero sleep on request threads.
-# ---------------------------------------------------------------------------
+STATS_INTERVAL = 1.0
 
-STATS_INTERVAL = 1.0   # seconds between full recomputes
-
-_stats_cache: dict = {}   # last computed snapshot per section
+_stats_cache: dict = {}
 
 
 def _build_cache():
-    """Recompute every stats section and store in _stats_cache."""
     global _stats_cache
     _stats_cache = {
-        "resources":   get_system_resources(),
-        "latency":     get_latencies(),
-        "calls_snap":  {
+        "resources":  get_system_resources(),
+        "latency":    get_latencies(),
+        "calls_snap": {
             "active":          list(active_calls.values()),
             "active_count":    len(active_calls),
             "total":           total_calls,
@@ -336,7 +294,6 @@ def _build_cache():
 
 
 def _stats_loop():
-    """Background daemon thread — runs forever, rebuilds cache every second."""
     while True:
         try:
             _build_cache()
@@ -346,7 +303,6 @@ def _stats_loop():
 
 
 def get_cached(section: str) -> dict:
-    """Return the last cached value for a section, or recompute if not ready."""
     if not _stats_cache:
         _build_cache()
     return _stats_cache.get(section, {})
@@ -358,7 +314,6 @@ def _start_background_loop():
     t.start()
 
 
-# Start immediately on import so the cache is warm before the first request
 _start_background_loop()
 
 
@@ -375,13 +330,13 @@ def snapshot() -> dict:
             "by_lang":         dict(calls_by_lang),
             "by_provider":     dict(calls_by_provider),
         },
-        "latency":      get_latencies(),
-        "models":       dict(model_info),
-        "resources":    get_system_resources(),
+        "latency":     get_latencies(),
+        "models":      dict(model_info),
+        "resources":   get_system_resources(),
         "concurrency": {
-            "active_count":       len(active_calls),
-            "peak_concurrent":    peak_concurrent,
-            "whisper_queue":      whisper_queue_depth,
-            "tts_contention":     dict(tts_lock_contention),
+            "active_count":    len(active_calls),
+            "peak_concurrent": peak_concurrent,
+            "whisper_queue":   whisper_queue_depth,
+            "tts_contention":  dict(tts_lock_contention),
         },
     }
