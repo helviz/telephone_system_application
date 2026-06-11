@@ -1,10 +1,13 @@
+
 import time
 import os
 import psutil
-import database
+import database  # persistent layer
 
 
+# ---------------------------------------------------------------------------
 # Call tracking
+# ---------------------------------------------------------------------------
 
 # { session_id: {"provider": str, "lang": str, "caller": str, "started_at": float} }
 active_calls: dict[str, dict] = {}
@@ -24,7 +27,10 @@ calls_by_lang: dict[str, int] = {"en": 0, "fr": 0, "sw": 0}
 calls_by_provider: dict[str, int] = {"twilio": 0, "telnyx": 0}
 
 
+# ---------------------------------------------------------------------------
 # Pipeline latency (rolling average over last 20 measurements)
+# ---------------------------------------------------------------------------
+
 _WINDOW = 20
 
 _stt_latencies: list[float] = []
@@ -37,7 +43,10 @@ def _rolling_avg(samples: list[float]) -> float | None:
     return round(sum(samples) / len(samples), 3) if samples else None
 
 
+# ---------------------------------------------------------------------------
 # Model info — written once by sockets.py lifespan after preload completes
+# ---------------------------------------------------------------------------
+
 model_info: dict = {
     "whisper_size":       os.getenv("WHISPER_MODEL_SIZE", "medium"),
     "whisper_device":     os.getenv("WHISPER_DEVICE", "cpu"),
@@ -53,7 +62,10 @@ whisper_queue_depth: int = 0
 tts_lock_contention: dict[str, int] = {"en": 0, "fr": 0, "sw": 0}
 
 
+# ---------------------------------------------------------------------------
 # Public write API — called by sockets.py
+# ---------------------------------------------------------------------------
+
 def call_started(session_id: str, provider: str, lang: str,
                  caller_number: str = "UNKNOWN"):
     """
@@ -124,7 +136,10 @@ def record_e2e_latency(seconds: float):
         _e2e_latencies.pop(0)
 
 
+# ---------------------------------------------------------------------------
 # Public read API — called by dashboard routes
+# ---------------------------------------------------------------------------
+
 def avg_call_duration() -> float | None:
     if _completed_calls == 0:
         return None
@@ -217,14 +232,14 @@ def _sample_cpu_delta() -> float | None:
 
 def get_system_resources() -> dict:
     result = {
-        "ram_used_gb":  None,
-        "ram_total_gb": None,
-        "ram_pct":      None,
-        "cpu_pct":      None,
-        "gpu_used_mb":  None,
-        "gpu_total_mb": None,
-        "gpu_pct":      None,
-        "scoped":       True,
+        "ram_used_gb": 0.0,
+        "ram_total_gb": 0.0,
+        "ram_pct": 0.0,
+        "cpu_pct": 0.0,
+        "gpu_used_mb": 0.0,
+        "gpu_total_mb": 0.0,
+        "gpu_pct": 0.0,
+        "scoped": True,
     }
 
     used_bytes, limit_bytes = _read_cgroup_memory()
@@ -262,7 +277,10 @@ def get_system_resources() -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
 # Background stats loop
+# ---------------------------------------------------------------------------
+
 STATS_INTERVAL = 1.0
 
 _stats_cache: dict = {}
