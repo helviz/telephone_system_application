@@ -64,6 +64,10 @@ def _validate_twilio():
 # DASHBOARD — shell page
 # ===========================================================================
 
+# ===========================================================================
+# DASHBOARD — shell page
+# ===========================================================================
+
 DASHBOARD_SHELL = """
 <!DOCTYPE html>
 <html lang="en">
@@ -73,31 +77,36 @@ DASHBOARD_SHELL = """
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
         body { font-family: monospace; margin: 0; display: flex; height: 100vh; }
-        #sidebar { width: 180px; flex-shrink: 0; border-right: 1px solid #ccc; padding: 1rem 0; }
-        #sidebar a { display: block; padding: 0.5rem 1rem; text-decoration: none; color: inherit; }
-        #sidebar a:hover { background: #f0f0f0; }
-        #main { flex: 1; overflow-y: auto; padding: 1rem; }
-        .section { border: 1px solid #ccc; margin-bottom: 1rem; padding: 1rem; }
-        .section h2 { margin: 0 0 0.75rem 0; font-size: 1rem; }
-        table { border-collapse: collapse; width: 100%; }
-        td, th { padding: 0.25rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }
-        th { font-weight: bold; }
-        .transcript-box { max-height: 200px; overflow-y: auto; background: #f9f9f9; padding: 0.5rem; border: 1px solid #eee; }
-        .user-turn { color: #0066cc; }
-        .assistant-turn { color: #cc3300; }
+        #sidebar { width: 180px; flex-shrink: 0; border-right: 1px solid #ccc; padding: 1rem 0; background: #fafafa; }
+        #sidebar strong { display: block; padding: 0.5rem 1rem; border-bottom: 1px solid #eee; margin-bottom: 0.5rem; }
+        #sidebar a { display: block; padding: 0.5rem 1rem; text-decoration: none; color: #333; }
+        #sidebar a:hover { background: #f0f0f0; color: #000; }
+        #main { flex: 1; overflow-y: auto; padding: 1rem; scroll-behavior: smooth; }
+        .section { border: 1px solid #ccc; margin-bottom: 1.5rem; padding: 1rem; background: #fff; box-shadow: 1px 1px 3px rgba(0,0,0,0.05); }
+        .section h2 { margin: 0 0 0.75rem 0; font-size: 1rem; border-bottom: 1px solid #eee; padding-bottom: 0.25rem; }
+        table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+        td, th { padding: 0.4rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }
+        th { font-weight: bold; background: #f5f5f5; }
+        .transcript-box { max-height: 200px; overflow-y: auto; background: #f9f9f9; padding: 0.5rem; border: 1px solid #eee; font-size: 0.85rem; }
+        .user-turn { color: #0066cc; margin: 4px 0; }
+        .assistant-turn { color: #cc3300; margin: 4px 0; }
+        .log-box { max-height: 250px; overflow-y: auto; background: #222; color: #22c55e; padding: 0.75rem; border-radius: 4px; font-size: 0.85rem; }
+        .log-line { margin: 2px 0; border-bottom: 1px solid #2d2d2d; padding-bottom: 2px; }
+        .log-time { color: #a3a3a3; font-size: 0.75rem; margin-right: 8px; }
+        .log-dev { color: #38bdf8; margin-left: 6px; font-size: 0.75rem; }
     </style>
 </head>
 <body>
 
 <nav id="sidebar">
-    <strong style="padding: 0.5rem 1rem; display:block;">Dashboard</strong>
+    <strong>Dashboard</strong>
     <a href="#section-calls">Call Metrics</a>
     <a href="#section-transcripts">Live Transcripts</a>
     <a href="#section-latency">Pipeline Latency</a>
     <a href="#section-models">Model Health</a>
     <a href="#section-resources">System Resources</a>
     <a href="#section-concurrency">Concurrency</a>
-</nav>
+    <a href="#section-system-logs">⚙️ System Logs</a> </nav>
 
 <div id="main">
 
@@ -123,6 +132,10 @@ DASHBOARD_SHELL = """
 
     <div id="section-concurrency" hx-get="/dashboard/concurrency" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading concurrency info...
+    </div>
+
+    <div id="section-system-logs" hx-get="/dashboard/system-logs" hx-trigger="load, every 5s" hx-swap="innerHTML">
+        Loading initialization and lifecycle logs from database...
     </div>
 
 </div>
@@ -487,3 +500,44 @@ def telnyx_language():
 @app.route("/health", methods=["GET"])
 def health():
     return {"status": "ok"}, 200
+
+
+@app.route("/dashboard/system-logs", methods=["GET"])
+def dashboard_system_logs():
+    """NEW COMPATIBLE ENDPOINT: Reads model startup performance profiles from the SQLite database."""
+    html_lines = ["<div class='section'><h2>System Logs (Database Startup Lifecycle)</h2>"]
+    html_lines.append("<div class='log-box'>")
+
+    try:
+        with _get_db_connection() as conn:
+            # Fetch the initialization logs ordered by execution sequence
+            logs = conn.execute("""
+                                SELECT model_name, duration_s, device, loaded_at
+                                FROM model_load_logs
+                                ORDER BY id DESC LIMIT 15
+                                """).fetchall()
+
+            if not logs:
+                html_lines.append(
+                    "<div class='log-line'><span class='log-time'>—</span> No hardware configuration records found in SQLite.</div>")
+
+            for log in logs:
+                # Fallback formatter strings for older SQLite records without formal timestamp formatting
+                timestamp_str = log["loaded_at"]
+                if hasattr(timestamp_str, "strftime"):
+                    timestamp_str = timestamp_str.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                html_lines.append(
+                    f"<div class='log-line'>"
+                    f"<span class='log-time'>[{timestamp_str}]</span>"
+                    f"INIT_STAGE: Component <strong style='color:#fff;'>{log['model_name']}</strong> "
+                    f"allocated inside engine space in <strong style='color:#facc15;'>{log['duration_s']}s</strong>"
+                    f"<span class='log-dev'>[Target: {log['device'].upper()}]</span>"
+                    f"</div>"
+                )
+    except Exception as e:
+        html_lines.append(
+            f"<div class='log-line' style='color:#ef4444;'>Failed to query database engine logs: {e}</div>")
+
+    html_lines.append("</div></div>")
+    return "".join(html_lines)
