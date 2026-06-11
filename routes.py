@@ -1,6 +1,7 @@
 import os
+import sqlite3
 from flask import Flask, request, Response, abort, render_template_string
-from twilio.twiml.voice_response import VoiceResponse, Connect, Gather, Say
+from twilio.twiml.voice_response import VoiceResponse, Connect, Gather
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
 import stats
@@ -11,6 +12,12 @@ app = Flask(__name__)
 
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 VALIDATE_TWILIO = os.getenv("VALIDATE_TWILIO_SIGNATURE", "true").lower() == "true"
+
+# Resolve database path to pull metrics directly for the dashboard
+if os.path.exists("/data"):
+    DB_PATH = "/data/voice_assistant.db"
+else:
+    DB_PATH = os.getenv("SQLITE_DB_PATH", "voice_assistant.db")
 
 LANG_MAP = {
     "1": ("en", "English"),
@@ -31,6 +38,13 @@ IVR_INVALID = (
 )
 
 
+def _get_db_connection():
+    """Helper to open a quick, read-only sync connection for Flask metrics."""
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def _public_host() -> str:
     return os.getenv("PUBLIC_HOST") or request.host
 
@@ -39,15 +53,16 @@ def _validate_twilio():
     if VALIDATE_TWILIO and TWILIO_AUTH_TOKEN:
         validator = RequestValidator(TWILIO_AUTH_TOKEN)
         if not validator.validate(
-            request.url,
-            request.form,
-            request.headers.get("X-Twilio-Signature", ""),
+                request.url,
+                request.form,
+                request.headers.get("X-Twilio-Signature", ""),
         ):
             abort(403, description="Invalid Twilio signature")
 
 
-
-# DASHBOARD — shell page (served once, HTMX loads sections independently)
+# ===========================================================================
+# DASHBOARD — shell page
+# ===========================================================================
 
 DASHBOARD_SHELL = """
 <!DOCTYPE html>
@@ -58,41 +73,18 @@ DASHBOARD_SHELL = """
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
         body { font-family: monospace; margin: 0; display: flex; height: 100vh; }
-
-        /* Sidebar nav */
-        #sidebar {
-            width: 180px;
-            flex-shrink: 0;
-            border-right: 1px solid #ccc;
-            padding: 1rem 0;
-        }
-        #sidebar a {
-            display: block;
-            padding: 0.5rem 1rem;
-            text-decoration: none;
-            color: inherit;
-        }
+        #sidebar { width: 180px; flex-shrink: 0; border-right: 1px solid #ccc; padding: 1rem 0; }
+        #sidebar a { display: block; padding: 0.5rem 1rem; text-decoration: none; color: inherit; }
         #sidebar a:hover { background: #f0f0f0; }
-
-        /* Main content area */
-        #main {
-            flex: 1;
-            overflow-y: auto;
-            padding: 1rem;
-        }
-
-        /* Each section */
-        .section {
-            border: 1px solid #ccc;
-            margin-bottom: 1rem;
-            padding: 1rem;
-        }
+        #main { flex: 1; overflow-y: auto; padding: 1rem; }
+        .section { border: 1px solid #ccc; margin-bottom: 1rem; padding: 1rem; }
         .section h2 { margin: 0 0 0.75rem 0; font-size: 1rem; }
-
-        /* Generic table inside sections */
         table { border-collapse: collapse; width: 100%; }
         td, th { padding: 0.25rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }
         th { font-weight: bold; }
+        .transcript-box { max-height: 200px; overflow-y: auto; background: #f9f9f9; padding: 0.5rem; border: 1px solid #eee; }
+        .user-turn { color: #0066cc; }
+        .assistant-turn { color: #cc3300; }
     </style>
 </head>
 <body>
@@ -100,6 +92,7 @@ DASHBOARD_SHELL = """
 <nav id="sidebar">
     <strong style="padding: 0.5rem 1rem; display:block;">Dashboard</strong>
     <a href="#section-calls">Call Metrics</a>
+    <a href="#section-transcripts">Live Transcripts</a>
     <a href="#section-latency">Pipeline Latency</a>
     <a href="#section-models">Model Health</a>
     <a href="#section-resources">System Resources</a>
@@ -108,38 +101,27 @@ DASHBOARD_SHELL = """
 
 <div id="main">
 
-    <div id="section-calls"
-         hx-get="/dashboard/calls"
-         hx-trigger="load, every 2s"
-         hx-swap="innerHTML">
+    <div id="section-calls" hx-get="/dashboard/calls" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading call metrics...
     </div>
 
-    <div id="section-latency"
-         hx-get="/dashboard/latency"
-         hx-trigger="load, every 2s"
-         hx-swap="innerHTML">
+    <div id="section-transcripts" hx-get="/dashboard/transcripts" hx-trigger="load, every 3s" hx-swap="innerHTML">
+        Loading persistent conversations...
+    </div>
+
+    <div id="section-latency" hx-get="/dashboard/latency" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading latency...
     </div>
 
-    <div id="section-models"
-         hx-get="/dashboard/models"
-         hx-trigger="load, every 10s"
-         hx-swap="innerHTML">
+    <div id="section-models" hx-get="/dashboard/models" hx-trigger="load, every 10s" hx-swap="innerHTML">
         Loading model info...
     </div>
 
-    <div id="section-resources"
-         hx-get="/dashboard/resources"
-         hx-trigger="load, every 2s"
-         hx-swap="innerHTML">
+    <div id="section-resources" hx-get="/dashboard/resources" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading system resources...
     </div>
 
-    <div id="section-concurrency"
-         hx-get="/dashboard/concurrency"
-         hx-trigger="load, every 2s"
-         hx-swap="innerHTML">
+    <div id="section-concurrency" hx-get="/dashboard/concurrency" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading concurrency info...
     </div>
 
@@ -154,24 +136,35 @@ def dashboard():
     return render_template_string(DASHBOARD_SHELL)
 
 
- 
-# DASHBOARD FRAGMENTS — each returns a bare <div class="section"> block
- 
+# ===========================================================================
+# DASHBOARD FRAGMENTS
+# ===========================================================================
 
 @app.route("/dashboard/calls", methods=["GET"])
 def dashboard_calls():
+    # Keep historical stats object capability intact
     s = stats.get_cached("calls_snap")
     active = s.get("active", [])
+
+    # Query database directly to combine live stats with persistent data counts
+    try:
+        with _get_db_connection() as conn:
+            historical_total = conn.execute("SELECT COUNT(*) as cnt FROM call_logs").fetchone()["cnt"]
+            failed_total = conn.execute("SELECT COUNT(*) as cnt FROM call_logs WHERE status='failed'").fetchone()["cnt"]
+    except Exception:
+        historical_total = s["total"]
+        failed_total = s["failed"]
+
     html = """
     <div class="section">
         <h2>Call Metrics</h2>
         <table>
             <tr><th>Metric</th><th>Value</th></tr>
-            <tr><td>Active calls</td><td>{active_count}</td></tr>
+            <tr><td>Active calls (in memory)</td><td>{active_count}</td></tr>
             <tr><td>&nbsp;&nbsp;↳ Twilio</td><td>{twilio_active}</td></tr>
             <tr><td>&nbsp;&nbsp;↳ Telnyx</td><td>{telnyx_active}</td></tr>
-            <tr><td>Total calls (since start)</td><td>{total}</td></tr>
-            <tr><td>Failed / dropped</td><td>{failed}</td></tr>
+            <tr><td>Total Historical Records (SQLite)</td><td>{total}</td></tr>
+            <tr><td>Total Persistent Failed Logs</td><td>{failed}</td></tr>
             <tr><td>Peak concurrent</td><td>{peak}</td></tr>
             <tr><td>Avg call duration</td><td>{avg_dur}</td></tr>
             <tr><td>Calls by language</td><td>en={en} fr={fr} sw={sw}</td></tr>
@@ -182,8 +175,8 @@ def dashboard_calls():
         active_count=s["active_count"],
         twilio_active=sum(1 for c in active if c["provider"] == "twilio"),
         telnyx_active=sum(1 for c in active if c["provider"] == "telnyx"),
-        total=s["total"],
-        failed=s["failed"],
+        total=historical_total,
+        failed=failed_total,
         peak=s["peak_concurrent"],
         avg_dur=f"{s['avg_duration_s']}s" if s["avg_duration_s"] else "—",
         en=s["by_lang"].get("en", 0),
@@ -193,6 +186,49 @@ def dashboard_calls():
         telnyx=s["by_provider"].get("telnyx", 0),
     )
     return html
+
+
+@app.route("/dashboard/transcripts", methods=["GET"])
+def dashboard_transcripts():
+    """NEW COMPATIBLE ENDPOINT: Renders Whisper & LLM responses directly on the dashboard."""
+    html_lines = ["<div class='section'><h2>Recent Whispers & LLM Conversations</h2>"]
+
+    try:
+        with _get_db_connection() as conn:
+            # Grab the last 3 call sessions that received text data
+            sessions = conn.execute("""
+                                    SELECT DISTINCT session_id
+                                    FROM transcript_logs
+                                    ORDER BY id DESC LIMIT 3
+                                    """).fetchall()
+
+            if not sessions:
+                html_lines.append(
+                    "<p style='color:gray;'>No recorded text exchanges yet. Speak into the line to populate.</p>")
+
+            for sess in sessions:
+                sid = sess["session_id"]
+                html_lines.append(f"<strong>Session: {sid}</strong>")
+                html_lines.append("<div class='transcript-box'>")
+
+                turns = conn.execute("""
+                                     SELECT role, text, timestamp
+                                     FROM transcript_logs
+                                     WHERE session_id = ?
+                                     ORDER BY timestamp ASC
+                                     """, (sid,)).fetchall()
+
+                for turn in turns:
+                    cls = "user-turn" if turn["role"] == "user" else "assistant-turn"
+                    label = "👤 User (Whisper)" if turn["role"] == "user" else "🤖 Assistant (LLM)"
+                    html_lines.append(f"<p class='{cls}'><strong>{label}:</strong> {turn['text']}</p>")
+
+                html_lines.append("</div><br>")
+    except Exception as e:
+        html_lines.append(f"<p style='color:red;'>Failed to load transcripts from DB: {e}</p>")
+
+    html_lines.append("</div>")
+    return "".join(html_lines)
 
 
 @app.route("/dashboard/latency", methods=["GET"])
@@ -259,7 +295,6 @@ def dashboard_models():
 def dashboard_resources():
     r = stats.get_cached("resources")
 
-    # Warn when cgroup read failed and we fell back to host-level psutil
     scope_warning = ""
     if not r.get("scoped", True):
         scope_warning = (
@@ -269,8 +304,8 @@ def dashboard_resources():
         )
 
     ram_total = r["ram_total_gb"]
-    ram_pct   = r["ram_pct"]
-    ram_str   = (
+    ram_pct = r["ram_pct"]
+    ram_str = (
         f"{r['ram_used_gb']} GB / {ram_total} GB ({ram_pct}%)"
         if ram_total else
         f"{r['ram_used_gb']} GB (limit unknown)"
@@ -336,9 +371,9 @@ def dashboard_concurrency():
     return html
 
 
- 
-# Raw JSON endpoint (for debugging / external monitoring)
- 
+# ===========================================================================
+# Raw JSON endpoint
+# ===========================================================================
 
 @app.route("/metrics", methods=["GET"])
 def metrics():
@@ -346,13 +381,9 @@ def metrics():
     return Response(json.dumps(stats.snapshot(), indent=2), mimetype="application/json")
 
 
-# snapshot() still computes fresh for /metrics (used for debugging/monitoring)
-# — only the HTMX dashboard fragments use the cache
-
-
- 
+# ===========================================================================
 # TWILIO
- 
+# ===========================================================================
 
 @app.route("/twilio/voice", methods=["POST"])
 def twilio_voice():
@@ -378,7 +409,7 @@ def twilio_language():
     _validate_twilio()
 
     digit = request.form.get("Digits", "")
-    host  = _public_host()
+    host = _public_host()
 
     if digit not in LANG_MAP:
         resp = VoiceResponse()
@@ -399,8 +430,6 @@ def twilio_language():
 
     resp = VoiceResponse()
     connect = Connect()
-    # Pass the caller's E.164 number as a query param so the WebSocket
-    # handler can record it in the persistent call_logs table.
     caller = request.form.get("From", "UNKNOWN")
     connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}")
     resp.append(connect)
@@ -408,9 +437,9 @@ def twilio_language():
     return Response(str(resp), mimetype="text/xml")
 
 
- 
+# ===========================================================================
 # TELNYX
- 
+# ===========================================================================
 
 @app.route("/telnyx/voice", methods=["POST"])
 def telnyx_voice():
@@ -428,7 +457,7 @@ def telnyx_voice():
 @app.route("/telnyx/language", methods=["POST"])
 def telnyx_language():
     digit = request.form.get("Digits", "")
-    host  = _public_host()
+    host = _public_host()
 
     if digit not in LANG_MAP:
         texml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -451,9 +480,9 @@ def telnyx_language():
     return Response(texml, mimetype="text/xml")
 
 
- 
+# ===========================================================================
 # Health check
- 
+# ===========================================================================
 
 @app.route("/health", methods=["GET"])
 def health():
