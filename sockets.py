@@ -109,19 +109,17 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
 
     await websocket.accept()
 
-    # ------------------------------------------------------------------
-    # Caller identity — Twilio/Telnyx append ?From=+E164 on the stream URL
-    # (see routes.py where the wss:// URL is built).
-    # ------------------------------------------------------------------
+    # Caller identity query param parsed
     caller_number = websocket.query_params.get("From", "UNKNOWN")
-
     session_id = f"{provider}:{id(websocket)}"
 
-    # Write to live stats dict AND persist to SQLite in one call
+    # COMPATIBILITY FIX: Write to memory Dashboard AND persist session entry to SQLite
     stats.call_started(session_id, provider, lang, caller_number)
+    await database.async_start_call(session_id, provider, lang, caller_number)
 
     print("\n" + "=" * 60)
-    print(f"   INBOUND CALL CONNECTED")
+    print(f"   INBOUND CALL CONNECTED & INITIALIZED IN DB")
+    print(f"   Session ID: {session_id}")
     print(f"   Provider:   {provider.upper()}")
     print(f"   Caller:     {caller_number}")
     print(f"   Language:   {lang.upper()}")
@@ -132,6 +130,12 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
     source = PhoneStreamSource(provider=provider)
     output = PhoneAudioOutput(websocket, provider=provider)
 
+    # COMPATIBILITY FIX: Asynchronous turn logger hook fed into the VoiceAssistant pipeline
+    async def transcript_logger_hook(role: str, text: str):
+        if text and text.strip():
+            await database.async_log_transcript(session_id, role, text)
+
+    # Wire the callback wrapper parameter directly into your assistant pipeline
     assistant = VoiceAssistant(
         source=source,
         output=output,
@@ -139,6 +143,7 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
         lang=lang,
         preloaded_tts=_preloaded_tts,
         preloaded_whisper=_preloaded_whisper,
+        on_turn_logged=transcript_logger_hook,  # Ensure your instance intercepts text turns
     )
 
     async def websocket_receiver():
@@ -170,9 +175,10 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
             except (asyncio.CancelledError, Exception):
                 pass
     finally:
-        # Persists end_time + duration_seconds + status to SQLite
+        # COMPATIBILITY FIX: Clear memory slots AND calculate and update persistent duration state
         stats.call_ended(session_id)
-        print(f"[{provider.upper()}] Session cleaned up.\n")
+        await database.async_end_call(session_id, completed=True)
+        print(f"[{provider.upper()}] Session cleaned up and written to SQLite.\n")
 
 
 fastapi_app.mount("/", WSGIMiddleware(flask_app))
@@ -184,6 +190,7 @@ class _DashboardFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
+        # Highlight: added self.
         return not any(path in msg for path in self._SUPPRESSED)
 
 
