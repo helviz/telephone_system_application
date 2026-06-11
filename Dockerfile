@@ -44,12 +44,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ── Copy app ─
 COPY . .
 
+# ── Persistent Storage Directory Configuration ──────
+# Create the /data volume point used in database.py and set permissions
+# so it can be safely written to by container runtime users.
+RUN mkdir -p /data && chmod 777 /data
+
 RUN chmod +x /app/start.sh
 
 # ── Environment Configuration for Free Tier ──────────
-# Define a local cache directory that Hugging Face can read/write smoothly.
 ENV HF_HOME=/app/.cache
-RUN mkdir -p /app/.cache
+RUN mkdir -p /app/.cache && chmod 777 /app/.cache
 
 # Expose the standard port used by Hugging Face Spaces
 EXPOSE 7860
