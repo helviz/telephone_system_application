@@ -1,11 +1,14 @@
-# Maintain exact Python 3.10 environment
-FROM python:3.10-slim
+# Use an explicit NVIDIA CUDA base runtime to leverage the T4 GPU
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# Install lightweight system requirements (no heavy build-essential or cmake)
+# Install system dependencies and Python 3.10
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3-dev \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
@@ -14,9 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# Set up aliases so 'python' points to our installation
+RUN ln -s /usr/bin/python3.10 /usr/bin/python && ln -s /usr/bin/pip3 /usr/bin/pip
+
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Core ML Stack
+# Install PyTorch with explicit CUDA 12.1 support
+RUN pip install --no-cache-dir torch==2.3.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Core Accelerated ML Stack
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
     ctranslate2==4.7.1 \
@@ -32,7 +41,7 @@ RUN pip install --no-cache-dir \
     tokenizers \
     safetensors
 
-# Install App packages and the pre-compiled llama-cpp wheel
+# Copy requirements and install the rest of your app dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
