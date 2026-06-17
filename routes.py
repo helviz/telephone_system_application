@@ -459,7 +459,10 @@ def twilio_language():
 
     connect = Connect()
     caller = request.form.get("From", "UNKNOWN")
-    connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}")
+    call_sid = request.form.get("CallSid", caller)
+    connect.stream(
+        url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}&CallSid={call_sid}"
+    )
     resp.append(connect)
 
     return Response(str(resp), mimetype="text/xml")
