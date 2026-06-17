@@ -119,15 +119,13 @@ fastapi_app = FastAPI(lifespan=lifespan)
 
 
 @fastapi_app.websocket("/media-stream/twilio/{lang}")
-async def websocket_endpoint(websocket: WebSocket, lang: str):
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
 
     # Extract dynamic session language query parameter strings
     query_params = websocket.query_params
-    lang = lang.strip().lower()
-    provider = "twilio"
-    caller = query_params.get("From", "UNKNOWN")
-    session_id = websocket.query_params.get("CallSid", caller)
+    lang = query_params.get("lang", "en").strip().lower()
+    provider = query_params.get("provider", LLM_PROVIDER).strip().lower()
 
     print(f"\n📲 Incoming Call Connection Session Established.")
     print(
@@ -143,7 +141,7 @@ async def websocket_endpoint(websocket: WebSocket, lang: str):
     assistant = VoiceAssistant(
         source=source,
         output=output,
-        provider=LLM_PROVIDER,
+        provider=provider,
         lang=lang,
         preloaded_tts=_preloaded_tts,
         preloaded_whisper=_preloaded_whisper,
