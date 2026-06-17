@@ -118,47 +118,71 @@ async def lifespan(fastapi_app: FastAPI):
 fastapi_app = FastAPI(lifespan=lifespan)
 
 
-@fastapi_app.websocket("/media-stream/twilio/{lang}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
+# ---------------------------------------------------------------------------
+# WebSocket endpoint — Multi-provider support (Twilio & Telnyx)
+# ---------------------------------------------------------------------------
+@fastapi_app.websocket("/media-stream/{provider}/{lang}")
+async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
+    supported_providers = {"twilio", "telnyx"}
+    supported_langs = {"en", "fr", "sw"}
+
+    if provider not in supported_providers or lang not in supported_langs:
+        print(f"[REJECTED] Provider={provider}, Lang={lang}")
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
 
-    # Extract dynamic session language query parameter strings
-    query_params = websocket.query_params
-    lang = query_params.get("lang", "en").strip().lower()
-    provider = query_params.get("provider", LLM_PROVIDER).strip().lower()
+    # Caller identity query param parsed
+    caller_number = websocket.query_params.get("From", "UNKNOWN")
+    session_id = f"{provider}:{id(websocket)}"
 
-    print(f"\n📲 Incoming Call Connection Session Established.")
-    print(
-        f"   Session Token: {session_id} | Core Language Track: {lang.upper()} | Model Core Backend: {provider.upper()}")
+    # COMPATIBILITY FIX: Write to memory Dashboard AND persist session entry to SQLite
+    stats.call_started(session_id, provider, lang, caller_number)
+    await database.async_start_call(session_id, provider, lang, caller_number)
 
-    stats.call_started(session_id, provider=provider, lang=lang)
-    await database.async_start_call(session_id, provider=provider, lang=lang)
+    print("\n" + "=" * 60)
+    print(f"   INBOUND CALL CONNECTED & INITIALIZED IN DB")
+    print(f"   Session ID: {session_id}")
+    print(f"   Provider:   {provider.upper()}")
+    print(f"   Caller:     {caller_number}")
+    print(f"   Language:   {lang.upper()}")
+    _llm_label = stats.model_info.get("llm_provider", LLM_PROVIDER)
+    print(f"   LLM Engine: {_llm_label.upper()}")
+    print("=" * 60 + "\n")
 
-    # Initialize non-blocking local frame streams
-    source = PhoneStreamSource()
-    output = PhoneAudioOutput(websocket)
+    source = PhoneStreamSource(provider=provider)
+    output = PhoneAudioOutput(websocket, provider=provider)
 
+    # COMPATIBILITY FIX: Asynchronous turn logger hook fed into the VoiceAssistant pipeline
+    async def transcript_logger_hook(role: str, text: str):
+        if text and text.strip():
+            await database.async_log_transcript(session_id, role, text)
+
+    # Wire the callback wrapper parameter directly into your assistant pipeline
     assistant = VoiceAssistant(
         source=source,
         output=output,
-        provider=provider,
+        provider=LLM_PROVIDER,
         lang=lang,
         preloaded_tts=_preloaded_tts,
         preloaded_whisper=_preloaded_whisper,
-        on_turn_logged=lambda role, text: database.async_log_turn(session_id, role, text),
+        on_turn_logged=transcript_logger_hook,  # Ensure your instance intercepts text turns
     )
 
     async def websocket_receiver():
         try:
             while True:
-                data = await websocket.receive_bytes()
-                source.add_chunk(data)
+                message = await websocket.receive_text()
+                await source.add_data(message)
+
+                if source.stream_sid and not output.stream_sid:
+                    output.set_stream_sid(source.stream_sid)
+
         except WebSocketDisconnect:
-            print(f"\n❌ Telephony Endpoint Disconnected for Session {session_id}")
+            print(f"\n❌ [{provider.upper()}] Caller hung up")
         except Exception as e:
-            print(f"   [Socket Server Exception] Data frame ingestion dropped: {e}")
-        finally:
-            source.close()
+            print(f"\n[{provider.upper()}] Receiver error: {e}")
 
     receiver_task = asyncio.create_task(websocket_receiver())
     assistant_task = asyncio.create_task(assistant.start())
@@ -175,11 +199,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             except (asyncio.CancelledError, Exception):
                 pass
     finally:
+        # COMPATIBILITY FIX: Clear memory slots AND calculate and update persistent duration state
         stats.call_ended(session_id)
         await database.async_end_call(session_id, completed=True)
         print(f"[{provider.upper()}] Session cleaned up and written to SQLite.\n")
 
 
+# Mount the Flask Application WSGI Layer for the Admin Dashboard UI
 fastapi_app.mount("/", WSGIMiddleware(flask_app))
 
 
@@ -195,8 +221,6 @@ class _DashboardFilter(logging.Filter):
 def _configure_logging():
     logging.getLogger("uvicorn.access").addFilter(_DashboardFilter())
 
-
-_configure_logging()
 
 if __name__ == "__main__":
     import uvicorn
