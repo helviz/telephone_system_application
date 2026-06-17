@@ -1,27 +1,37 @@
-FROM python:3.10
+# ── Use Nvidia CUDA Base Image ───────────────────────
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
 
 WORKDIR /app
 
-# ── System dependencies ─────────────────────────────
+# ── Install Python 3.10 & System dependencies ────────
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3.10-dev \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
     curl \
     ca-certificates \
     build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/*
+
+# Set python3.10 as the default 'python' and 'pip'
+RUN ln -s /usr/bin/python3.10 /usr/bin/python && \
+    ln -s /usr/bin/pip3 /usr/bin/pip
 
 # ── Upgrade pip ─────────────────────────────────────
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# ── PyTorch CPU (IMPORTANT: keep consistent with transformers) ─
+# ── PyTorch CUDA 12.1 (Replaces the old +cpu wheels) ─
 RUN pip install --no-cache-dir \
-    torch==2.3.0+cpu \
-    torchaudio==2.3.0+cpu \
-    --extra-index-url https://download.pytorch.org/whl/cpu
+    torch==2.3.0 \
+    torchaudio==2.3.0 \
+    --index-url https://download.pytorch.org/whl/cu121
 
-# ── Core ML stack (from your conda file, cleaned) ─
+# ── Core ML stack ───────────────────────────────────
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
     ctranslate2==4.7.1 \
@@ -31,32 +41,32 @@ RUN pip install --no-cache-dir \
     scipy \
     numpy
 
-# ── LLM / Transformers (FIXED COMPATIBILITY) ─
+# ── LLM / Transformers ──────────────────────────────
 RUN pip install --no-cache-dir \
     transformers==4.41.0 \
     tokenizers \
     safetensors
 
-# ── App requirements ─
+# ── Compile llama-cpp-python with CUDA Acceleration ──
+ENV FORCE_CMAKE=1
+ENV LLAMA_CUDA=on
+RUN pip install --force-reinstall --no-cache-dir llama-cpp-python
+
+# ── App requirements ────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Copy app ─
+# ── Copy app ────────────────────────────────────────
 COPY . .
 
 # ── Persistent Storage Directory Configuration ──────
-# Create the /data volume point used in database.py and set permissions
-# so it can be safely written to by container runtime users.
 RUN mkdir -p /data && chmod 777 /data
-
 RUN chmod +x /app/start.sh
 
-# ── Environment Configuration for Free Tier ──────────
+# ── Environment Configuration ───────────────────────
 ENV HF_HOME=/app/.cache
 RUN mkdir -p /app/.cache && chmod 777 /app/.cache
 
-# Expose the standard port used by Hugging Face Spaces
 EXPOSE 7860
 
-# Run the startup script
 CMD ["/app/start.sh"]
