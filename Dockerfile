@@ -1,14 +1,11 @@
-# ── Use Nvidia CUDA Base Image ───────────────────────
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+# ── Maintain exact Python 3.10 environment ──────────
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# ── Install Python 3.10 & System dependencies ────────
+# ── Install CUDA runtime repositories & dependencies ──
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3-pip \
-    python3.10-dev \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
@@ -16,22 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     build-essential \
     git \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
-# Set python3.10 as the default 'python' and 'pip'
-RUN ln -s /usr/bin/python3.10 /usr/bin/python && \
-    ln -s /usr/bin/pip3 /usr/bin/pip
+# ── Upgrade pip and core compiler components ──────────
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel scikit-build-core
 
-# ── Upgrade pip ─────────────────────────────────────
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-
-# ── PyTorch CUDA 12.1 (Replaces the old +cpu wheels) ─
+# ── PyTorch with CUDA 12.1 acceleration ──────────────
 RUN pip install --no-cache-dir \
     torch==2.3.0 \
     torchaudio==2.3.0 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# ── Core ML stack ───────────────────────────────────
+# ── Core ML Stack ───────────────────────────────────
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
     ctranslate2==4.7.1 \
@@ -47,16 +41,16 @@ RUN pip install --no-cache-dir \
     tokenizers \
     safetensors
 
-# ── Compile llama-cpp-python with CUDA Acceleration ──
-ENV FORCE_CMAKE=1
-ENV LLAMA_CUDA=on
-RUN pip install --force-reinstall --no-cache-dir llama-cpp-python
-
-# ── App requirements ────────────────────────────────
+# ── Install App packages from requirements.txt ───────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Copy app ────────────────────────────────────────
+# ── Compile llama-cpp-python with CUDA Support ───────
+ENV FORCE_CMAKE=1
+ENV LLAMA_CUDA=on
+RUN pip install --force-reinstall --no-cache-dir llama-cpp-python==0.3.22
+
+# ── Copy Application Files ──────────────────────────
 COPY . .
 
 # ── Persistent Storage Directory Configuration ──────
