@@ -40,12 +40,12 @@ except Exception as e:
     sys.exit(1)
 
 
-# TTS — Facebook MMS-TTS (en / fr / sw)
-print("📦 [2/3] Loading MMS-TTS models (en / fr / sw) ...")
+#TTS — Facebook MMS-TTS
+print("📦 [2/3] Loading Facebook MMS-TTS (en, fr, sw) ...")
 t = time.time()
 try:
-    import torch
     from transformers import VitsModel, AutoTokenizer
+    import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tts_models = {
@@ -69,24 +69,20 @@ except Exception as e:
     print(f"   ❌ TTS failed to load: {e}")
     sys.exit(1)
 
-#LLM — GGUF singleton (only if LLM_PROVIDER=qwen/gguf)
-llm_provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+
+#LLM — GGUF singleton (only if LLM_PROVIDER is configured for local running profiles)
+llm_provider = os.getenv("LLM_PROVIDER", "gguf").strip().lower()
 
 if llm_provider in ("qwen", "gguf", "local"):
-    print("📦 [3/3] Loading GGUF LLM ...")
+    print("📦 [3/3] Preloading Local GGUF LLM ...")
     t = time.time()
     try:
-        from llmModule.GGUFStrategy import _get_llm
-        _get_llm()   # populates the module-level singleton
-        print(f"   ✅ GGUF LLM ready — {time.time()-t:.1f}s\n")
+        from llmModule.LLM import LLM
+        # This triggers the factory initialization, parses URLs/Shorthands, and loads the singleton to system RAM
+        LLM.get_model(provider="gguf", lang="en")
+        print(f"   ✅ GGUF Model successfully loaded and cached in RAM — {time.time()-t:.1f}s\n")
     except Exception as e:
-        print(f"   ❌ GGUF LLM failed to load: {e}")
+        print(f"   ❌ GGUF LLM failed to preload: {e}")
         sys.exit(1)
-else:
-    print(f"📦 [3/3] LLM provider is [{llm_provider}] — skipping GGUF preload.\n")
 
-
-print("=" * 60)
-print(f"✅ ALL MODELS READY — total startup time: {time.time()-total_start:.1f}s")
-print("🚀 Handing off to uvicorn...\n")
-print("=" * 60 + "\n")
+print(f"🎉 Preload pipeline successful. Total setup execution window: {time.time() - total_start:.1f}s\n")
