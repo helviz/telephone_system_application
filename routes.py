@@ -408,7 +408,8 @@ def twilio_voice():
         timeout=10,
         finish_on_key="",
     )
-    gather.say(IVR_GREETING)
+    # Use premium neural voice to present initial language options
+    gather.say(IVR_GREETING, voice="Polly.Joanna-Neural")
     resp.append(gather)
     resp.redirect("/twilio/voice", method="POST")
 
@@ -431,7 +432,7 @@ def twilio_language():
             timeout=10,
             finish_on_key="",
         )
-        gather.say(IVR_INVALID)
+        gather.say(IVR_INVALID, voice="Polly.Joanna-Neural")
         resp.append(gather)
         resp.redirect("/twilio/voice", method="POST")
         return Response(str(resp), mimetype="text/xml")
@@ -441,8 +442,20 @@ def twilio_language():
 
     resp = VoiceResponse()
 
-    # Render the localized greeting prompt right before patching into the stream
-    resp.say(HELP_GREETINGS[lang], language=lang)
+    # Map your selected language to a premium, clear voice profile
+    voice_profiles = {
+        "en": "Polly.Joanna-Neural",
+        "fr": "Polly.Celine-Neural",
+        "sw": "Polly.Jambo"
+    }
+    selected_voice = voice_profiles.get(lang, "Polly.Joanna-Neural")
+
+    # Use the advanced voice engine to speak your greeting text cleanly
+    resp.say(
+        HELP_GREETINGS[lang],
+        language=lang,
+        voice=selected_voice
+    )
 
     connect = Connect()
     caller = request.form.get("From", "UNKNOWN")
