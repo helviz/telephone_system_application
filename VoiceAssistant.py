@@ -27,8 +27,8 @@ class VoiceAssistant:
             provider="gemini",
             lang="en",
             preloaded_tts: dict = None,
-            preloaded_whisper=None,
-            on_turn_logged=None,  # 👈 Added optional DB persistence hook
+            preloaded_whisper="medium",
+            on_turn_logged=None,
     ):
         allowed_langs = ["en", "fr", "sw"]
         if lang not in allowed_langs:

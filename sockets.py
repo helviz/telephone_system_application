@@ -44,7 +44,7 @@ def _load_models():
     t = time.time()
     from faster_whisper import WhisperModel
 
-    resolved_size   = os.getenv("WHISPER_MODEL_SIZE", "small").strip()
+    resolved_size   = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
     resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type    = "float16" if resolved_device == "cuda" else "int8"
 
