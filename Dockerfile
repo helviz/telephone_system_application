@@ -25,6 +25,9 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # Install PyTorch with explicit CUDA 12.1 support
 RUN pip install --no-cache-dir torch==2.3.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
 
+# Install GPU-accelerated llama-cpp-python directly via pre-built wheels
+RUN pip install --no-cache-dir llama-cpp-python==0.3.22 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+
 # Core Accelerated ML Stack
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
@@ -41,7 +44,7 @@ RUN pip install --no-cache-dir \
     tokenizers \
     safetensors
 
-# Copy requirements and install the rest of your app dependencies
+# Copy requirements and install remaining standard packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
