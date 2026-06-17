@@ -118,7 +118,7 @@ async def lifespan(fastapi_app: FastAPI):
 fastapi_app = FastAPI(lifespan=lifespan)
 
 
-@fastapi_app.websocket("/ws/{session_id}")
+@fastapi_app.websocket("/media-stream/twilio/{lang}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
 
