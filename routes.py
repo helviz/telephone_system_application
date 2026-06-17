@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from html import escape
 from flask import Flask, request, Response, abort, render_template_string
 from twilio.twiml.voice_response import VoiceResponse, Connect, Gather
 from twilio.request_validator import RequestValidator
@@ -66,6 +67,15 @@ def _validate_twilio():
             abort(403, description="Invalid Twilio signature")
 
 
+def _format_language_counts(counts: dict) -> str:
+    """Return public-friendly language counts for dashboard display."""
+    return (
+        f"English: {counts.get('en', 0)} &nbsp;|&nbsp; "
+        f"French: {counts.get('fr', 0)} &nbsp;|&nbsp; "
+        f"Swahili: {counts.get('sw', 0)}"
+    )
+
+
 # ===========================================================================
 # DASHBOARD — shell page
 # ===========================================================================
@@ -116,6 +126,7 @@ DASHBOARD_SHELL = """
         .log-line { margin: 0; border-bottom: 1px solid #2d2d2d; padding: 3px 0; }
         .log-time { color: #a3a3a3; font-size: 0.72rem; margin-right: 8px; }
         .log-dev { color: #38bdf8; margin-left: 6px; font-size: 0.72rem; }
+        .language-summary { line-height: 1.6; }
     </style>
 </head>
 <body>
@@ -125,7 +136,6 @@ DASHBOARD_SHELL = """
     <a href="#section-calls">Call Metrics</a>
     <a href="#section-live-feed">Live Transcript Feed</a>
     <a href="#section-latency">Pipeline Latency</a>
-    <a href="#section-models">Model Health</a>
     <a href="#section-resources">System Resources</a>
     <a href="#section-concurrency">Concurrency</a>
     <a href="#section-transcripts">Live Transcripts</a>
@@ -149,9 +159,6 @@ DASHBOARD_SHELL = """
         Loading latency...
     </div>
 
-    <div id="section-models" hx-get="/dashboard/models" hx-trigger="load, every 10s" hx-swap="innerHTML">
-        Loading model info...
-    </div>
 
     <div id="section-resources" hx-get="/dashboard/resources" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading system resources...
@@ -187,7 +194,6 @@ def dashboard():
 @app.route("/dashboard/calls", methods=["GET"])
 def dashboard_calls():
     s = stats.get_cached("calls_snap")
-    active = s.get("active", [])
 
     try:
         with _get_db_connection() as conn:
@@ -203,36 +209,27 @@ def dashboard_calls():
         <table>
             <tr><th>Metric</th><th>Value</th></tr>
             <tr><td>Active calls</td><td>{active_count}</td></tr>
-            <tr><td>&nbsp;&nbsp;↳ Twilio</td><td>{twilio_active}</td></tr>
-            <tr><td>&nbsp;&nbsp;↳ Telnyx</td><td>{telnyx_active}</td></tr>
             <tr><td>Total Historical Records (SQLite)</td><td>{total}</td></tr>
             <tr><td>Total Persistent Failed Logs</td><td>{failed}</td></tr>
             <tr><td>Peak concurrent</td><td>{peak}</td></tr>
             <tr><td>Avg call duration</td><td>{avg_dur}</td></tr>
-            <tr><td>Calls by language</td><td>en={en} fr={fr} sw={sw}</td></tr>
-            <tr><td>Calls by provider</td><td>Twilio={twilio} Telnyx={telnyx}</td></tr>
+            <tr><td>Calls by language</td><td class="language-summary">{language_counts}</td></tr>
         </table>
     </div>
     """.format(
         active_count=s["active_count"],
-        twilio_active=sum(1 for c in active if c["provider"] == "twilio"),
-        telnyx_active=sum(1 for c in active if c["provider"] == "telnyx"),
         total=historical_total,
         failed=failed_total,
         peak=s["peak_concurrent"],
         avg_dur=f"{s['avg_duration_s']}s" if s["avg_duration_s"] else "—",
-        en=s["by_lang"].get("en", 0),
-        fr=s["by_lang"].get("fr", 0),
-        sw=s["by_lang"].get("sw", 0),
-        twilio=s["by_provider"].get("twilio", 0),
-        telnyx=s["by_provider"].get("telnyx", 0),
+        language_counts=_format_language_counts(s["by_lang"]),
     )
     return html
 
 
 @app.route("/dashboard/transcripts", methods=["GET"])
 def dashboard_transcripts():
-    html_lines = ["<div class='section'><h2>Recent Whispers & LLM Conversations</h2>"]
+    html_lines = ["<div class='section'><h2>Recent Voice Conversations</h2>"]
 
     try:
         with _get_db_connection() as conn:
@@ -260,8 +257,8 @@ def dashboard_transcripts():
 
                 for turn in turns:
                     cls = "user-turn" if turn["role"] == "user" else "assistant-turn"
-                    label = "👤 User (Whisper)" if turn["role"] == "user" else "🤖 Assistant (LLM)"
-                    html_lines.append(f"<p class='{cls}'><strong>{label}:</strong> {turn['text']}</p>")
+                    label = "👤 User (Whisper)" if turn["role"] == "user" else "🤖 Assistant"
+                    html_lines.append(f"<p class='{cls}'><strong>{label}:</strong> {escape(str(turn['text']))}</p>")
 
                 html_lines.append("</div><br>")
     except Exception as e:
@@ -284,7 +281,7 @@ def dashboard_latency():
         <table>
             <tr><th>Stage</th><th>Avg Latency</th></tr>
             <tr><td>STT (audio → transcript)</td><td>{stt}</td></tr>
-            <tr><td>LLM (transcript → first token)</td><td>{llm}</td></tr>
+            <tr><td>Response generation (transcript → first token)</td><td>{llm}</td></tr>
             <tr><td>TTS (first token → first audio)</td><td>{tts}</td></tr>
             <tr><td>End-to-end</td><td>{e2e}</td></tr>
         </table>
@@ -300,35 +297,8 @@ def dashboard_latency():
 
 @app.route("/dashboard/models", methods=["GET"])
 def dashboard_models():
-    m = stats.get_cached("models")
-    tts_langs = ", ".join(m["tts_languages"]) if m["tts_languages"] else "—"
-    preload_status = "✅ OK" if m["preload_ok"] else "⚠️ fallback / pending"
-    preload_dur = f"{m['preload_duration_s']}s" if m["preload_duration_s"] else "—"
-
-    html = """
-    <div class="section">
-        <h2>Model Health</h2>
-        <table>
-            <tr><th>Item</th><th>Value</th></tr>
-            <tr><td>Whisper model size</td><td>{whisper_size}</td></tr>
-            <tr><td>Whisper device</td><td>{whisper_device}</td></tr>
-            <tr><td>TTS languages loaded</td><td>{tts_langs}</td></tr>
-            <tr><td>LLM provider</td><td>{llm_provider}</td></tr>
-            <tr><td>LLM model</td><td>{llm_model}</td></tr>
-            <tr><td>Preload status</td><td>{preload_status}</td></tr>
-            <tr><td>Preload duration</td><td>{preload_dur}</td></tr>
-        </table>
-    </div>
-    """.format(
-        whisper_size=m["whisper_size"],
-        whisper_device=m["whisper_device"],
-        tts_langs=tts_langs,
-        llm_provider=m["llm_provider"],
-        llm_model=m["llm_model"],
-        preload_status=preload_status,
-        preload_dur=preload_dur,
-    )
-    return html
+    """Model details are intentionally hidden from the public dashboard."""
+    return ""
 
 
 @app.route("/dashboard/resources", methods=["GET"])
@@ -395,18 +365,14 @@ def dashboard_concurrency():
             <tr><td>Active calls</td><td>{active}</td></tr>
             <tr><td>Peak concurrent calls</td><td>{peak}</td></tr>
             <tr><td>Whisper queue depth</td><td>{whisper_q}</td></tr>
-            <tr><td>TTS contention — en</td><td>{tts_en}</td></tr>
-            <tr><td>TTS contention — fr</td><td>{tts_fr}</td></tr>
-            <tr><td>TTS contention — sw</td><td>{tts_sw}</td></tr>
+            <tr><td>TTS contention by language</td><td class="language-summary">{tts_contention}</td></tr>
         </table>
     </div>
     """.format(
         active=c.get("active_count", 0),
         peak=c.get("peak_concurrent", 0),
         whisper_q=c.get("whisper_queue", 0),
-        tts_en=tts_c.get("en", 0),
-        tts_fr=tts_c.get("fr", 0),
-        tts_sw=tts_c.get("sw", 0),
+        tts_contention=_format_language_counts(tts_c),
     )
     return html
 
@@ -445,7 +411,7 @@ def dashboard_live_feed():
                 for turn in turns:
                     cls = "user-turn" if turn["role"] == "user" else "assistant-turn"
                     label = "user" if turn["role"] == "user" else "assistant"
-                    html_lines.append(f"<p class='{cls}'><strong>{label}</strong> &nbsp;{turn['text']}</p>")
+                    html_lines.append(f"<p class='{cls}'><strong>{label}</strong> &nbsp;{escape(str(turn['text']))}</p>")
                 html_lines.append("</div>")
     except Exception as e:
         html_lines.append(f"<p style='color:red; font-size:0.85rem;'>Failed to load live feed: {e}</p>")
@@ -615,10 +581,10 @@ def dashboard_system_logs():
 
                 html_lines.append(
                     f"<div class='log-line'>"
-                    f"<span class='log-time'>[{timestamp_str}]</span>"
-                    f"INIT_STAGE: Component <strong style='color:#fff;'>{log['model_name']}</strong> "
+                    f"<span class='log-time'>[{escape(str(timestamp_str))}]</span>"
+                    f"INIT_STAGE: Component <strong style='color:#fff;'>{escape(str(log['model_name']))}</strong> "
                     f"allocated inside engine space in <strong style='color:#facc15;'>{log['duration_s']}s</strong>"
-                    f"<span class='log-dev'>[Target: {log['device'].upper()}]</span>"
+                    f"<span class='log-dev'>[Target: {escape(str(log['device']).upper())}]</span>"
                     f"</div>"
                 )
     except Exception as e:
