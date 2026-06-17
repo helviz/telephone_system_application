@@ -50,9 +50,11 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Sanity check at build time: fail fast if llama-cpp-python ends up CPU-only
-# or if the CUDA backend isn't actually compiled in.
-RUN python -c "from llama_cpp import llama_cpp; print('GPU offload available:', llama_cpp.llama_supports_gpu_offload())"
+# NOTE: Cannot verify GPU offload here — no GPU/driver is attached during the
+# build step (libcuda.so.1 only exists on the running T4 instance, not the
+# builder). Verify GPU offload at container runtime instead, e.g. by logging
+# llama_cpp.llama_supports_gpu_offload() from inside start.sh or app code
+# after the container is actually running on the T4 hardware.
 
 # Copy the remaining codebase files
 COPY . .
