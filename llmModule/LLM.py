@@ -240,7 +240,12 @@ class LLM:
     def get_model(provider="gguf", lang="en"):
         prompt = LLM.SYSTEM_PROMPTS.get(lang, LLM.SYSTEM_PROMPTS["en"])
 
-        if provider == "gemini":
+        # Normalize string matching to safely catch typos/aliases
+        normalized_provider = str(provider).strip().lower()
+        if normalized_provider in ("gguf", "qwen", "local"):
+            normalized_provider = "gguf"
+
+        if normalized_provider == "gemini":
             from llmModule.GoogleGeminiStrategy import GeminiStrategy
 
             gemini_api = os.getenv("GEMINI_API_KEY")
@@ -252,7 +257,7 @@ class LLM:
                 system_prompt=prompt
             )
 
-        elif provider == "gguf":
+        elif normalized_provider == "gguf":
             from llmModule.GGUFStrategy import GGUFStrategy
 
             local_path = os.getenv("LOCAL_MODEL_PATH")
@@ -265,4 +270,4 @@ class LLM:
             )
 
         else:
-            raise ValueError(f"Unknown LLM provider: {provider}")
+            raise ValueError(f"Unknown LLM provider configuration matched: '{provider}'")
