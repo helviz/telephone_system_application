@@ -103,9 +103,9 @@ def _load_models():
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Offload heavy model synchronous I/O blocks safely into a separate background execution window
-    await asyncio.to_thread(_load_models())
+async def lifespan(fastapi_app: FastAPI):
+    # Pass the function reference itself, NOT the evaluated output
+    await asyncio.to_thread(_load_models)
 
     # Save active runtime engine attributes back to stats tracker
     stats.model_info["llm_provider"] = LLM_PROVIDER
