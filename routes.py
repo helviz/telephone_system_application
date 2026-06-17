@@ -80,11 +80,20 @@ DASHBOARD_SHELL = """
     <style>
         * { box-sizing: border-box; }
         body { font-family: 'Courier New', monospace; margin: 0; display: flex; height: 100vh; color: #1a1a1a; }
-        #sidebar { width: 180px; flex-shrink: 0; border-right: 1px solid #ccc; padding: 1rem 0; background: #fafafa; }
+        #sidebar { width: 180px; flex-shrink: 0; border-right: 1px solid #ccc; padding: 1rem 0; background: #fafafa; transition: margin-left 0.2s ease; }
+        #sidebar.collapsed { margin-left: -180px; }
         #sidebar strong { display: block; padding: 0.5rem 1rem; border-bottom: 1px solid #eee; margin-bottom: 0.5rem; font-size: 0.85rem; letter-spacing: 0.02em; }
         #sidebar a { display: block; padding: 0.5rem 1rem; text-decoration: none; color: #333; font-size: 0.85rem; }
         #sidebar a:hover { background: #f0f0f0; color: #000; }
         #main { flex: 1; overflow-y: auto; padding: 1rem; scroll-behavior: smooth; }
+
+        #topbar { display: flex; align-items: center; margin-bottom: 0.75rem; }
+        #hamburger-btn { width: 32px; height: 32px; border: 1px solid #e2e2e2; background: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
+        #hamburger-btn:hover { background: #f5f5f5; }
+        #hamburger-btn span { display: block; width: 16px; height: 2px; background: #444; position: relative; }
+        #hamburger-btn span::before, #hamburger-btn span::after { content: ""; position: absolute; left: 0; width: 16px; height: 2px; background: #444; }
+        #hamburger-btn span::before { top: -5px; }
+        #hamburger-btn span::after { top: 5px; }
 
         .section { border: 1px solid #e2e2e2; margin-bottom: 0.75rem; padding: 0.75rem 1rem; background: #fff; }
         .section h2 { margin: 0 0 0.5rem 0; font-size: 0.8rem; font-weight: bold; letter-spacing: 0.04em; text-transform: uppercase; color: #444; }
@@ -114,22 +123,26 @@ DASHBOARD_SHELL = """
 <nav id="sidebar">
     <strong>Dashboard</strong>
     <a href="#section-calls">Call Metrics</a>
-    <a href="#section-transcripts">Live Transcripts</a>
+    <a href="#section-live-feed">Live Transcript Feed</a>
     <a href="#section-latency">Pipeline Latency</a>
     <a href="#section-models">Model Health</a>
     <a href="#section-resources">System Resources</a>
     <a href="#section-concurrency">Concurrency</a>
-    <a href="#section-live-feed">Live Transcript Feed</a>
+    <a href="#section-transcripts">Live Transcripts</a>
     <a href="#section-system-logs">⚙️ System Logs</a> </nav>
 
 <div id="main">
+
+    <div id="topbar">
+        <button id="hamburger-btn" aria-label="Toggle sidebar" onclick="document.getElementById('sidebar').classList.toggle('collapsed')"><span></span></button>
+    </div>
 
     <div id="section-calls" hx-get="/dashboard/calls" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading call metrics...
     </div>
 
-    <div id="section-transcripts" hx-get="/dashboard/transcripts" hx-trigger="load, every 3s" hx-swap="innerHTML">
-        Loading persistent conversations...
+    <div id="section-live-feed" hx-get="/dashboard/live-feed" hx-trigger="load, every 2s" hx-swap="innerHTML">
+        Loading live transcript feed...
     </div>
 
     <div id="section-latency" hx-get="/dashboard/latency" hx-trigger="load, every 2s" hx-swap="innerHTML">
@@ -148,8 +161,8 @@ DASHBOARD_SHELL = """
         Loading concurrency info...
     </div>
 
-    <div id="section-live-feed" hx-get="/dashboard/live-feed" hx-trigger="load, every 2s" hx-swap="innerHTML">
-        Loading live transcript feed...
+    <div id="section-transcripts" hx-get="/dashboard/transcripts" hx-trigger="load, every 3s" hx-swap="innerHTML">
+        Loading persistent conversations...
     </div>
 
     <div id="section-system-logs" hx-get="/dashboard/system-logs" hx-trigger="load, every 5s" hx-swap="innerHTML">
