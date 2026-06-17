@@ -25,6 +25,12 @@ LANG_MAP = {
     "3": ("sw", "Swahili"),
 }
 
+HELP_GREETINGS = {
+    "en": "How can I help you?",
+    "fr": "Comment puis-je vous aider?",
+    "sw": "Nawezaje kukusaidia?",
+}
+
 IVR_GREETING = (
     "Hello! Please select your language. "
     "Press 1 for English. "
@@ -59,10 +65,6 @@ def _validate_twilio():
         ):
             abort(403, description="Invalid Twilio signature")
 
-
-# ===========================================================================
-# DASHBOARD — shell page
-# ===========================================================================
 
 # ===========================================================================
 # DASHBOARD — shell page
@@ -155,11 +157,9 @@ def dashboard():
 
 @app.route("/dashboard/calls", methods=["GET"])
 def dashboard_calls():
-    # Keep historical stats object capability intact
     s = stats.get_cached("calls_snap")
     active = s.get("active", [])
 
-    # Query database directly to combine live stats with persistent data counts
     try:
         with _get_db_connection() as conn:
             historical_total = conn.execute("SELECT COUNT(*) as cnt FROM call_logs").fetchone()["cnt"]
@@ -203,12 +203,10 @@ def dashboard_calls():
 
 @app.route("/dashboard/transcripts", methods=["GET"])
 def dashboard_transcripts():
-    """NEW COMPATIBLE ENDPOINT: Renders Whisper & LLM responses directly on the dashboard."""
     html_lines = ["<div class='section'><h2>Recent Whispers & LLM Conversations</h2>"]
 
     try:
         with _get_db_connection() as conn:
-            # Grab the last 3 call sessions that received text data
             sessions = conn.execute("""
                                     SELECT DISTINCT session_id
                                     FROM transcript_logs
@@ -442,6 +440,10 @@ def twilio_language():
     print(f"[Twilio IVR] Caller selected: {lang_name} ({lang})")
 
     resp = VoiceResponse()
+
+    # Render the localized greeting prompt right before patching into the stream
+    resp.say(HELP_GREETINGS[lang], language=lang)
+
     connect = Connect()
     caller = request.form.get("From", "UNKNOWN")
     connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}")
@@ -488,6 +490,7 @@ def telnyx_language():
     caller = request.form.get("From", "UNKNOWN")
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Say>{HELP_GREETINGS[lang]}</Say>
     <Stream url="wss://{host}/media-stream/telnyx/{lang}?From={caller}" />
 </Response>"""
     return Response(texml, mimetype="text/xml")
@@ -510,7 +513,6 @@ def dashboard_system_logs():
 
     try:
         with _get_db_connection() as conn:
-            # Fetch the initialization logs ordered by execution sequence
             logs = conn.execute("""
                                 SELECT model_name, duration_s, device, loaded_at
                                 FROM model_load_logs
@@ -522,7 +524,6 @@ def dashboard_system_logs():
                     "<div class='log-line'><span class='log-time'>—</span> No hardware configuration records found in SQLite.</div>")
 
             for log in logs:
-                # Fallback formatter strings for older SQLite records without formal timestamp formatting
                 timestamp_str = log["loaded_at"]
                 if hasattr(timestamp_str, "strftime"):
                     timestamp_str = timestamp_str.strftime("%Y-%m-%d %H:%M:%S UTC")
