@@ -17,6 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# ==============================================================================
+# CRITICAL LINKER FIX: Replace Conda's outdated libstdc++.so.6 with the system's
+# updated version containing GLIBCXX_3.4.30 so the pre-built CUDA wheels can link.
+# ==============================================================================
+RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
+    ln -s /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/conda/lib/libstdc++.so.6
+
 # Upgrade foundational packaging infrastructure
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
