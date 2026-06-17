@@ -78,24 +78,35 @@ DASHBOARD_SHELL = """
     <title>Voice Assistant — System Dashboard</title>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
-        body { font-family: monospace; margin: 0; display: flex; height: 100vh; }
+        * { box-sizing: border-box; }
+        body { font-family: 'Courier New', monospace; margin: 0; display: flex; height: 100vh; color: #1a1a1a; }
         #sidebar { width: 180px; flex-shrink: 0; border-right: 1px solid #ccc; padding: 1rem 0; background: #fafafa; }
-        #sidebar strong { display: block; padding: 0.5rem 1rem; border-bottom: 1px solid #eee; margin-bottom: 0.5rem; }
-        #sidebar a { display: block; padding: 0.5rem 1rem; text-decoration: none; color: #333; }
+        #sidebar strong { display: block; padding: 0.5rem 1rem; border-bottom: 1px solid #eee; margin-bottom: 0.5rem; font-size: 0.85rem; letter-spacing: 0.02em; }
+        #sidebar a { display: block; padding: 0.5rem 1rem; text-decoration: none; color: #333; font-size: 0.85rem; }
         #sidebar a:hover { background: #f0f0f0; color: #000; }
         #main { flex: 1; overflow-y: auto; padding: 1rem; scroll-behavior: smooth; }
-        .section { border: 1px solid #ccc; margin-bottom: 1.5rem; padding: 1rem; background: #fff; box-shadow: 1px 1px 3px rgba(0,0,0,0.05); }
-        .section h2 { margin: 0 0 0.75rem 0; font-size: 1rem; border-bottom: 1px solid #eee; padding-bottom: 0.25rem; }
-        table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
-        td, th { padding: 0.4rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }
-        th { font-weight: bold; background: #f5f5f5; }
-        .transcript-box { max-height: 200px; overflow-y: auto; background: #f9f9f9; padding: 0.5rem; border: 1px solid #eee; font-size: 0.85rem; }
-        .user-turn { color: #0066cc; margin: 4px 0; }
-        .assistant-turn { color: #cc3300; margin: 4px 0; }
-        .log-box { max-height: 250px; overflow-y: auto; background: #222; color: #22c55e; padding: 0.75rem; border-radius: 4px; font-size: 0.85rem; }
-        .log-line { margin: 2px 0; border-bottom: 1px solid #2d2d2d; padding-bottom: 2px; }
-        .log-time { color: #a3a3a3; font-size: 0.75rem; margin-right: 8px; }
-        .log-dev { color: #38bdf8; margin-left: 6px; font-size: 0.75rem; }
+
+        .section { border: 1px solid #e2e2e2; margin-bottom: 0.75rem; padding: 0.75rem 1rem; background: #fff; }
+        .section h2 { margin: 0 0 0.5rem 0; font-size: 0.8rem; font-weight: bold; letter-spacing: 0.04em; text-transform: uppercase; color: #444; }
+        .section h2 small { text-transform: none; font-weight: normal; letter-spacing: normal; color: #999; font-size: 0.75rem; }
+
+        .live-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; display: inline-block; margin-left: 6px; }
+
+        table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+        td, th { padding: 3px 0; text-align: left; border-bottom: 1px solid #f0f0f0; }
+        th { font-weight: bold; color: #777; background: none; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.03em; }
+        tr:last-child td { border-bottom: none; }
+
+        .transcript-box { max-height: 200px; overflow-y: auto; background: #fff; padding: 0; font-size: 0.8rem; }
+        .user-turn, .assistant-turn { margin: 0; padding: 3px 0; border-bottom: 1px solid #f5f5f5; }
+        .user-turn strong, .assistant-turn strong { font-weight: bold; text-transform: lowercase; }
+        .user-turn strong { color: #0066cc; }
+        .assistant-turn strong { color: #cc3300; }
+
+        .log-box { max-height: 250px; overflow-y: auto; background: #222; color: #22c55e; padding: 0.6rem; font-size: 0.78rem; }
+        .log-line { margin: 0; border-bottom: 1px solid #2d2d2d; padding: 3px 0; }
+        .log-time { color: #a3a3a3; font-size: 0.72rem; margin-right: 8px; }
+        .log-dev { color: #38bdf8; margin-left: 6px; font-size: 0.72rem; }
     </style>
 </head>
 <body>
@@ -108,6 +119,7 @@ DASHBOARD_SHELL = """
     <a href="#section-models">Model Health</a>
     <a href="#section-resources">System Resources</a>
     <a href="#section-concurrency">Concurrency</a>
+    <a href="#section-live-feed">Live Transcript Feed</a>
     <a href="#section-system-logs">⚙️ System Logs</a> </nav>
 
 <div id="main">
@@ -134,6 +146,10 @@ DASHBOARD_SHELL = """
 
     <div id="section-concurrency" hx-get="/dashboard/concurrency" hx-trigger="load, every 2s" hx-swap="innerHTML">
         Loading concurrency info...
+    </div>
+
+    <div id="section-live-feed" hx-get="/dashboard/live-feed" hx-trigger="load, every 2s" hx-swap="innerHTML">
+        Loading live transcript feed...
     </div>
 
     <div id="section-system-logs" hx-get="/dashboard/system-logs" hx-trigger="load, every 5s" hx-swap="innerHTML">
@@ -173,7 +189,7 @@ def dashboard_calls():
         <h2>Call Metrics</h2>
         <table>
             <tr><th>Metric</th><th>Value</th></tr>
-            <tr><td>Active calls (in memory)</td><td>{active_count}</td></tr>
+            <tr><td>Active calls</td><td>{active_count}</td></tr>
             <tr><td>&nbsp;&nbsp;↳ Twilio</td><td>{twilio_active}</td></tr>
             <tr><td>&nbsp;&nbsp;↳ Telnyx</td><td>{telnyx_active}</td></tr>
             <tr><td>Total Historical Records (SQLite)</td><td>{total}</td></tr>
@@ -380,6 +396,49 @@ def dashboard_concurrency():
         tts_sw=tts_c.get("sw", 0),
     )
     return html
+
+
+@app.route("/dashboard/live-feed", methods=["GET"])
+def dashboard_live_feed():
+    """Compact live view of the most recent session's transcript turns,
+    sitting between Concurrency and System Logs on the dashboard."""
+    html_lines = [
+        "<div class='section'>",
+        "<h2>Live transcript feed<span class='live-dot'></span> <small>(most recent session)</small></h2>",
+    ]
+
+    try:
+        with _get_db_connection() as conn:
+            latest_session = conn.execute("""
+                                          SELECT session_id
+                                          FROM transcript_logs
+                                          ORDER BY id DESC LIMIT 1
+                                          """).fetchone()
+
+            if not latest_session:
+                html_lines.append(
+                    "<p style='color:gray; font-size:0.85rem;'>No active session yet.</p>")
+            else:
+                sid = latest_session["session_id"]
+                turns = conn.execute("""
+                                     SELECT role, text, timestamp
+                                     FROM transcript_logs
+                                     WHERE session_id = ?
+                                     ORDER BY timestamp DESC LIMIT 8
+                                     """, (sid,)).fetchall()
+                turns = list(reversed(turns))
+
+                html_lines.append("<div class='transcript-box'>")
+                for turn in turns:
+                    cls = "user-turn" if turn["role"] == "user" else "assistant-turn"
+                    label = "user" if turn["role"] == "user" else "assistant"
+                    html_lines.append(f"<p class='{cls}'><strong>{label}</strong> &nbsp;{turn['text']}</p>")
+                html_lines.append("</div>")
+    except Exception as e:
+        html_lines.append(f"<p style='color:red; font-size:0.85rem;'>Failed to load live feed: {e}</p>")
+
+    html_lines.append("</div>")
+    return "".join(html_lines)
 
 
 # ===========================================================================
