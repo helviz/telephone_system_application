@@ -1,9 +1,9 @@
-# ── Maintain exact Python 3.10 environment ──────────
+# Maintain exact Python 3.10 environment
 FROM python:3.10-slim
 
 WORKDIR /app
 
-# ── Install CUDA runtime repositories & dependencies ──
+# Install lightweight system requirements (no heavy build-essential or cmake)
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -11,21 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     curl \
     ca-certificates \
-    build-essential \
     git \
-    cmake \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Upgrade pip and core compiler components ──────────
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel scikit-build-core
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# ── PyTorch with CUDA 12.1 acceleration ──────────────
-RUN pip install --no-cache-dir \
-    torch==2.3.0 \
-    torchaudio==2.3.0 \
-    --index-url https://download.pytorch.org/whl/cu121
-
-# ── Core ML Stack ───────────────────────────────────
+# Core ML Stack
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
     ctranslate2==4.7.1 \
@@ -35,29 +26,24 @@ RUN pip install --no-cache-dir \
     scipy \
     numpy
 
-# ── LLM / Transformers ──────────────────────────────
+# LLM / Transformers Support
 RUN pip install --no-cache-dir \
     transformers==4.41.0 \
     tokenizers \
     safetensors
 
-# ── Install App packages from requirements.txt ───────
+# Install App packages and the pre-compiled llama-cpp wheel
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Compile llama-cpp-python with CUDA Support ───────
-ENV FORCE_CMAKE=1
-ENV LLAMA_CUDA=on
-RUN pip install --force-reinstall --no-cache-dir llama-cpp-python==0.3.22
-
-# ── Copy Application Files ──────────────────────────
+# Copy Application Files
 COPY . .
 
-# ── Persistent Storage Directory Configuration ──────
+# Persistent Storage Directory Configuration
 RUN mkdir -p /data && chmod 777 /data
 RUN chmod +x /app/start.sh
 
-# ── Environment Configuration ───────────────────────
+# Environment Configuration
 ENV HF_HOME=/app/.cache
 RUN mkdir -p /app/.cache && chmod 777 /app/.cache
 
