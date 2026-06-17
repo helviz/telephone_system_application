@@ -24,7 +24,7 @@ class VoiceAssistant:
             self,
             source,
             output,
-            provider="gemini",
+            provider="gguf",
             lang="en",
             preloaded_tts: dict = None,
             preloaded_whisper="medium",
