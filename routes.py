@@ -508,12 +508,6 @@ def twilio_language():
     selected_voice = voice_profiles.get(lang, "Polly.Joanna-Neural")
 
     # Use the advanced voice engine to speak your greeting text cleanly
-    resp.say(
-        HELP_GREETINGS[lang],
-        language=lang,
-        voice=selected_voice
-    )
-
     connect = Connect()
     caller = request.form.get("From", "UNKNOWN")
     connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}")
