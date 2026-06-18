@@ -499,15 +499,11 @@ def twilio_language():
 
     resp = VoiceResponse()
 
-    # Map your selected language to a premium, clear voice profile
-    voice_profiles = {
-        "en": "Polly.Joanna-Neural",
-        "fr": "Polly.Celine-Neural",
-        "sw": "Polly.Jambo"
-    }
-    selected_voice = voice_profiles.get(lang, "Polly.Joanna-Neural")
-
-    # Use the advanced voice engine to speak your greeting text cleanly
+    # Do not play a second <Say> after language selection. Some Twilio voice /
+    # language combinations can fail before <Connect><Stream> is reached, which
+    # causes French or Swahili calls to end immediately after IVR selection.
+    # Connect directly to the media stream; the assistant/TTS layer handles the
+    # spoken response after the websocket opens.
     connect = Connect()
     caller = request.form.get("From", "UNKNOWN")
     connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}")
@@ -554,7 +550,13 @@ def telnyx_language():
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     {_telnyx_say(HELP_GREETINGS[lang], lang)}
-    <Stream url="wss://{host}/media-stream/telnyx/{lang}?From={escape(caller)}" />
+    <Stream 
+        url="wss://{host}/media-stream/telnyx/{lang}?From={escape(caller)}"
+        track="inbound_track"
+        codec="PCMU"
+        bidirectionalMode="rtp"
+        bidirectionalCodec="PCMU" />
+    <Pause length="3600"/>
 </Response>"""
     return Response(texml, mimetype="text/xml")
 
