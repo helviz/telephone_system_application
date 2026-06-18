@@ -44,6 +44,25 @@ IVR_INVALID = (
     "Press 1 for English, 2 for French, or 3 for Swahili."
 )
 
+# Telnyx TeXML voice settings. Telnyx defaults can sound poor, so explicitly
+# request clearer Polly voices for the IVR and short transition prompts.
+TELNYX_VOICE_PROFILES = {
+    "en": ("Polly.Joanna-Neural", "en-US"),
+    "fr": ("Polly.Celine-Neural", "fr-FR"),
+    "sw": ("Polly.Joanna-Neural", "en-US"),  # fallback for menu/transition prompt
+}
+TELNYX_DEFAULT_VOICE, TELNYX_DEFAULT_LANGUAGE = TELNYX_VOICE_PROFILES["en"]
+
+
+def _telnyx_say(text: str, lang: str = "en") -> str:
+    """Return a Telnyx <Say> tag using an explicit premium voice."""
+    voice, language = TELNYX_VOICE_PROFILES.get(lang, TELNYX_VOICE_PROFILES["en"])
+    return (
+        f'<Say voice="{escape(voice)}" language="{escape(language)}">'
+        f'{escape(text)}'
+        f'</Say>'
+    )
+
 
 def _get_db_connection():
     """Helper to open a quick, read-only sync connection for Flask metrics."""
@@ -513,12 +532,11 @@ def telnyx_voice():
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="10">
-        <Say>{IVR_GREETING}</Say>
+        {_telnyx_say(IVR_GREETING, "en")}
     </Gather>
     <Redirect method="POST">https://{host}/telnyx/voice</Redirect>
 </Response>"""
     return Response(texml, mimetype="text/xml")
-
 
 @app.route("/telnyx/language", methods=["POST"])
 def telnyx_language():
@@ -529,7 +547,7 @@ def telnyx_language():
         texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="10">
-        <Say>{IVR_INVALID}</Say>
+        {_telnyx_say(IVR_INVALID, "en")}
     </Gather>
     <Redirect method="POST">https://{host}/telnyx/voice</Redirect>
 </Response>"""
@@ -541,11 +559,10 @@ def telnyx_language():
     caller = request.form.get("From", "UNKNOWN")
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say>{HELP_GREETINGS[lang]}</Say>
-    <Stream url="wss://{host}/media-stream/telnyx/{lang}?From={caller}" />
+    {_telnyx_say(HELP_GREETINGS[lang], lang)}
+    <Stream url="wss://{host}/media-stream/telnyx/{lang}?From={escape(caller)}" />
 </Response>"""
     return Response(texml, mimetype="text/xml")
-
 
 # ===========================================================================
 # Health check
