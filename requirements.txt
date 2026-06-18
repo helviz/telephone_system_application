@@ -21,14 +21,5 @@ python-dateutil
 tenacity
 websockets
 
-# NOTE: using webrtcvad-wheels instead of plain `webrtcvad`. The original
-# webrtcvad package only ships as a source tarball on PyPI (no prebuilt
-# wheels for any Python version), so pip compiles its C extension at
-# install time. On Python 3.12+ that build can fail with
-# "ModuleNotFoundError: No module named 'distutils'" depending on the
-# setuptools version baked into the image. webrtcvad-wheels is a
-# maintained fork that ships prebuilt manylinux wheels (cp39 through
-# cp312+) so it installs as a plain binary download with no compiler
-# step required. It still exposes the same `import webrtcvad` module
-# and `webrtcvad.Vad` API, so no application code changes are needed.
+scipy==1.13.1
 webrtcvad-wheels==2.0.14
