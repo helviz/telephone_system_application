@@ -108,7 +108,16 @@ class GGUFStrategy(LLMStrategy):
                 temperature=0.4,
                 top_p=0.85,
                 repeat_penalty=1.30,
-                stop=["<|im_end|>", "User:", "Assistant:"],
+                stop=[
+                    "<|im_end|>",
+                    "User:",
+                    "user:",
+                    "\nUser:",
+                    "\nuser:",
+                    "Assistant:",
+                    "assistant:",
+                ]
+                ,
             )
 
         # Offloads the blocking synchronous create_chat_completion generator generator loops safely
