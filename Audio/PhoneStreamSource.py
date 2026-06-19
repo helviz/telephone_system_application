@@ -1,242 +1,202 @@
 import asyncio
-import collections
-import time
+import audioop
+import base64
+import json
+from typing import Any
+
+try:
+    from scipy.signal import resample_poly
+except Exception:  # pragma: no cover - fallback for minimal deployments
+    resample_poly = None
+
 import numpy as np
-import webrtcvad
-from faster_whisper import WhisperModel
+
 from Audio.AudioSource import AudioSource
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
-
-# --- VAD framing constants -------------------------------------------------
-# webrtcvad requires 16kHz mono PCM16 frames of exactly 10/20/30ms.
-# Our pipeline already normalizes everything to 16kHz upstream
-# (PhoneStreamSource upsamples 8k->16k, MicrophoneSource records at 16k),
-# so we frame at 20ms here regardless of source.
-SAMPLE_RATE = 16000
-FRAME_MS = 20
-FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # *2 for int16 bytes
-
-# How aggressive webrtcvad is about classifying a frame as speech.
-# 0 = least aggressive (more false positives on noise),
-# 3 = most aggressive (only very confident speech passes).
-VAD_AGGRESSIVENESS = int(os.getenv("WEBRTC_VAD_AGGRESSIVENESS", "1"))
-
-# Trailing silence required before we consider the utterance "finished"
-# and flush it to Whisper. This is the real end-of-utterance signal —
-# it replaces the old fixed CHUNK_BUFFER_SIZE cutoff.
-END_SILENCE_MS = int(os.getenv("STT_END_SILENCE_MS", "900"))
-END_SILENCE_FRAMES = max(1, END_SILENCE_MS // FRAME_MS)
-
-# How much silence to keep *before* detected speech onset and *after*
-# detected speech offset, so we don't clip the first/last phoneme.
-PADDING_MS = int(os.getenv("STT_PADDING_MS", "500"))
-PADDING_FRAMES = max(1, PADDING_MS // FRAME_MS)
-
-# Safety valve: if someone talks for a very long time without a pause,
-# force a flush so latency doesn't grow unbounded and memory doesn't balloon.
-MAX_UTTERANCE_MS = 20_000
-MAX_UTTERANCE_FRAMES = MAX_UTTERANCE_MS // FRAME_MS
-
-MIN_SAMPLES = int(os.getenv("STT_MIN_SAMPLES", "8000"))
-
-# Clamp externally supplied VAD aggressiveness to the valid webrtcvad range.
-VAD_AGGRESSIVENESS = max(0, min(3, VAD_AGGRESSIVENESS))
 
 
-class STTModule:
-    def __init__(self, model_size=None, device=None, lang="en", preloaded_model=None):
-        allowed_languages = ["en", "fr", "sw"]
-        if lang not in allowed_languages:
-            raise ValueError(f"Language '{lang}' not supported. Choose from {allowed_languages}")
+class PhoneStreamSource(AudioSource):
+    """
+    Incoming phone media stream normalizer for Twilio and Telnyx.
 
-        self.lang = lang
+    Both providers are normalized into:
+      - PCM16
+      - mono
+      - 16 kHz
 
-        if preloaded_model is not None:
-            self.model = preloaded_model
-            print(f"[STT] ♻️  Reusing preloaded Whisper model for [{lang}]")
-        else:
-            resolved_size   = model_size or os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
-            resolved_device = device     or os.getenv("WHISPER_DEVICE", "cpu").strip()
-            compute_type    = "float16" if resolved_device == "cuda" else "int8"
+    This is the format expected by transcribe/SSTModule.py, where WebRTC VAD
+    works on exact 16 kHz PCM16 frames.
+    """
 
-            print(f"[STT] 📦 Loading Whisper [{resolved_size}] on [{resolved_device}]...")
-            self.model = WhisperModel(
-                resolved_size,
-                device=resolved_device,
-                compute_type=compute_type,
-                download_root=os.getenv("HF_HOME"),
-            )
+    PROVIDERS = {"twilio", "telnyx"}
+    TARGET_STT_SAMPLE_RATE = 16000
+    DEFAULT_PHONE_SAMPLE_RATE = 8000
 
-    def _transcribe_blocking(self, audio_data: np.ndarray) -> list:
+    def __init__(self, provider: str = "twilio"):
+        provider = (provider or "twilio").strip().lower()
+        if provider not in self.PROVIDERS:
+            raise ValueError(f"Unsupported provider: '{provider}'. Choose from {self.PROVIDERS}")
+
+        self.provider = provider
+        self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        # Twilio uses streamSid; Telnyx uses stream_id. Keep both names so the
+        # rest of the app can remain provider-neutral.
+        self.stream_sid: str | None = None
+        self.stream_id: str | None = None
+        self.call_control_id: str | None = None
+
+        self.input_sample_rate = self.DEFAULT_PHONE_SAMPLE_RATE
+        self.input_channels = 1
+
+    async def add_data(self, websocket_message: str | bytes):
+        """Parse one provider websocket frame and enqueue PCM16/16k audio."""
+        if isinstance(websocket_message, bytes):
+            websocket_message = websocket_message.decode("utf-8", errors="ignore")
+
         try:
-            # We already segment the stream with webrtcvad before calling Whisper.
-            # Running Whisper's internal VAD again can clip low-volume or narrowband
-            # phone speech, especially Swahili over 8 kHz PCMU. Keep it disabled by
-            # default, but allow enabling through env when testing.
-            use_whisper_vad = os.getenv("WHISPER_INTERNAL_VAD", "false").lower() == "true"
+            packet: dict[str, Any] = json.loads(websocket_message)
+        except json.JSONDecodeError as exc:
+            print(f"[{self.provider.upper()}] Ignoring malformed websocket JSON: {exc}")
+            return
 
-            kwargs = dict(
-                language=self.lang,
-                beam_size=int(os.getenv("WHISPER_BEAM_SIZE", "5")),
-                condition_on_previous_text=False,
-                vad_filter=use_whisper_vad,
+        event = packet.get("event")
+
+        if event == "start":
+            self._handle_start(packet)
+            return
+
+        if event == "media":
+            await self._handle_media(packet)
+            return
+
+        if event == "stop":
+            print(f"[{self.provider.upper()}] Stream stop event received.")
+            return
+
+        if event == "mark":
+            name = packet.get("mark", {}).get("name")
+            print(f"[{self.provider.upper()}] Mark received: {name}")
+            return
+
+        if event == "dtmf":
+            digit = packet.get("dtmf", {}).get("digit")
+            print(f"[{self.provider.upper()}] DTMF received over stream: {digit}")
+            return
+
+        if event == "error":
+            print(f"[{self.provider.upper()}] Stream error: {packet.get('payload')}")
+            return
+
+        print(f"[{self.provider.upper()}] Ignored websocket event: {event}")
+
+    def _handle_start(self, packet: dict[str, Any]):
+        start = packet.get("start", {}) or {}
+
+        if self.provider == "twilio":
+            self.stream_sid = (
+                start.get("streamSid")
+                or packet.get("streamSid")
+                or packet.get("stream_sid")
             )
+            self.stream_id = self.stream_sid
+            self.call_control_id = start.get("callSid") or packet.get("callSid")
+            self.input_sample_rate = self.DEFAULT_PHONE_SAMPLE_RATE
+            self.input_channels = 1
+        else:
+            self.stream_id = packet.get("stream_id") or start.get("stream_id")
+            self.stream_sid = self.stream_id
+            self.call_control_id = start.get("call_control_id")
 
-            if use_whisper_vad:
-                kwargs["vad_parameters"] = dict(
-                    min_silence_duration_ms=int(os.getenv("WHISPER_VAD_MIN_SILENCE_MS", "900")),
-                    threshold=float(os.getenv("WHISPER_VAD_THRESHOLD", "0.35")),
-                    min_speech_duration_ms=int(os.getenv("WHISPER_VAD_MIN_SPEECH_MS", "250")),
-                )
+            try:
+                self.input_sample_rate = int(start.get("sample_rate") or self.DEFAULT_PHONE_SAMPLE_RATE)
+            except (TypeError, ValueError):
+                self.input_sample_rate = self.DEFAULT_PHONE_SAMPLE_RATE
 
-            segments, _ = self.model.transcribe(audio_data, **kwargs)
-            return [seg.text.strip() for seg in segments if seg.text.strip()]
-        except Exception as e:
-            print(f"[STT] ⚠️  Transcription error (chunk discarded): {e}")
-            return []
+            try:
+                self.input_channels = int(start.get("channels") or 1)
+            except (TypeError, ValueError):
+                self.input_channels = 1
 
-    @staticmethod
-    def _frame_generator(byte_stream_buffer: bytearray):
-        """
-        Slices a growing byte buffer into fixed-size 20ms frames as required
-        by webrtcvad. Consumes fully-formed frames from the front of the
-        buffer in place and yields each as raw bytes; leaves any trailing
-        partial frame in the buffer for the next call.
-        """
-        frames = []
-        offset = 0
-        while offset + FRAME_BYTES <= len(byte_stream_buffer):
-            frames.append(bytes(byte_stream_buffer[offset:offset + FRAME_BYTES]))
-            offset += FRAME_BYTES
-        # Drop consumed bytes, keep the leftover partial frame
-        del byte_stream_buffer[:offset]
-        return frames
-
-    def _bytes_to_float_audio(self, audio_bytes: bytes) -> np.ndarray:
-        if len(audio_bytes) % 2 != 0:
-            audio_bytes = audio_bytes[:-1]
-        return (
-            np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-            / 32768.0
+        print(
+            f"[{self.provider.upper()}] Stream started — "
+            f"stream_id={self.stream_id}, sample_rate={self.input_sample_rate}, "
+            f"channels={self.input_channels}"
         )
 
-    async def transcribe_stream(self, audio_source: AudioSource):
-        """
-        FIX: The previous implementation cut the incoming audio into fixed
-        150-chunk windows (~3s) with no overlap and handed each window to
-        Whisper's internal VAD blind. Any utterance that straddled a window
-        boundary got truncated or, if the speech fragment on either side of
-        the cut was shorter than min_speech_duration_ms, silently dropped
-        entirely. That's why callers were heard saying only the first few
-        words of a sentence, or only the last few — the cut point had
-        nothing to do with where they actually paused.
+    async def _handle_media(self, packet: dict[str, Any]):
+        media = packet.get("media", {}) or {}
+        payload = media.get("payload")
 
-        This version runs webrtcvad frame-by-frame (20ms frames, required
-        by webrtcvad) to find real speech boundaries. Audio is accumulated
-        into an utterance buffer for as long as speech (or a short pause
-        inside speech) continues, and the utterance is only flushed to
-        Whisper once a sustained trailing silence (END_SILENCE_MS) confirms
-        the person has actually stopped talking — plus a safety cap
-        (MAX_UTTERANCE_MS) so an unbroken monologue still gets flushed
-        periodically instead of buffering forever.
-        """
-        print(f"--- STT Active: Listening [{self.lang}] (VAD-segmented) ---")
-        loop = asyncio.get_running_loop()
-        vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-
-        byte_buffer = bytearray()          # raw bytes not yet sliced into frames
-        ring_pad = collections.deque(maxlen=PADDING_FRAMES)  # pre-speech padding ring
-        utterance_frames = []              # frames belonging to current utterance
-        in_speech = False
-        trailing_silence = 0               # consecutive non-speech frames since last speech frame
-
-        async def _flush(frames):
-            if not frames:
-                return
-            audio_bytes = b"".join(frames)
-            audio_data = self._bytes_to_float_audio(audio_bytes)
-
-            if len(audio_data) < MIN_SAMPLES:
-                return
-
-            t0 = time.time()
-            texts = await loop.run_in_executor(
-                None, self._transcribe_blocking, audio_data
-            )
-            stt_elapsed = time.time() - t0
-
-            if texts:
-                try:
-                    import stats
-                    stats.record_stt_latency(stt_elapsed)
-                except Exception:
-                    pass
-
-            for text in texts:
-                yield text
+        if not payload:
+            print(f"[{self.provider.upper()}] Media event without payload.")
+            return
 
         try:
-            async for chunk in audio_source.get_stream():
-                if not chunk or not isinstance(chunk, (bytes, bytearray)):
-                    continue
+            encoded_audio = base64.b64decode(payload)
+        except Exception as exc:
+            print(f"[{self.provider.upper()}] Failed to base64-decode media payload: {exc}")
+            return
 
-                byte_buffer.extend(chunk)
-                frames = self._frame_generator(byte_buffer)
+        # With your TwiML/TeXML config, both providers should send PCMU/G.711
+        # mu-law payloads. Telnyx bidirectional RTP mode sends the RTP payload
+        # without headers, so direct mu-law decoding is correct.
+        try:
+            pcm_phone_rate = audioop.ulaw2lin(encoded_audio, 2)
+        except Exception as exc:
+            print(f"[{self.provider.upper()}] Failed to decode PCMU/mu-law payload: {exc}")
+            return
 
-                for frame in frames:
-                    try:
-                        is_speech = vad.is_speech(frame, SAMPLE_RATE)
-                    except Exception:
-                        # Malformed frame (e.g. wrong length) — treat as silence
-                        # rather than crashing the stream.
-                        is_speech = False
+        if self.input_channels > 1:
+            try:
+                pcm_phone_rate = audioop.tomono(pcm_phone_rate, 2, 0.5, 0.5)
+            except Exception as exc:
+                print(f"[{self.provider.upper()}] Failed to downmix audio to mono: {exc}")
 
-                    if not in_speech:
-                        # Keep a short rolling pre-buffer so that when speech
-                        # *does* start, we don't lose the syllable right
-                        # before webrtcvad first flags it as speech.
-                        ring_pad.append(frame)
-                        if is_speech:
-                            in_speech = True
-                            trailing_silence = 0
-                            utterance_frames = list(ring_pad)
-                            utterance_frames.append(frame)
-                    else:
-                        utterance_frames.append(frame)
+        try:
+            pcm_16k = self._resample_pcm16(
+                pcm_phone_rate,
+                source_rate=int(self.input_sample_rate or self.DEFAULT_PHONE_SAMPLE_RATE),
+                target_rate=self.TARGET_STT_SAMPLE_RATE,
+            )
+        except Exception as exc:
+            print(f"[{self.provider.upper()}] Failed to resample audio to 16 kHz: {exc}")
+            return
 
-                        if is_speech:
-                            trailing_silence = 0
-                        else:
-                            trailing_silence += 1
+        await self.queue.put(pcm_16k)
 
-                        flushed = False
-                        if trailing_silence >= END_SILENCE_FRAMES:
-                            # Real pause long enough to count as end-of-utterance.
-                            async for text in _flush(utterance_frames):
-                                yield text
-                            flushed = True
-                        elif len(utterance_frames) >= MAX_UTTERANCE_FRAMES:
-                            # Safety valve for very long unbroken speech.
-                            async for text in _flush(utterance_frames):
-                                yield text
-                            flushed = True
+    @staticmethod
+    def _resample_pcm16(pcm_bytes: bytes, source_rate: int, target_rate: int) -> bytes:
+        """Resample PCM16 mono bytes. Prefer scipy anti-aliasing, fallback to audioop."""
+        if source_rate == target_rate:
+            return pcm_bytes
 
-                        if flushed:
-                            utterance_frames = []
-                            in_speech = False
-                            trailing_silence = 0
-                            ring_pad.clear()
+        if source_rate <= 0 or target_rate <= 0:
+            raise ValueError("source_rate and target_rate must be positive")
 
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[STT] ❌ Stream error: {e}")
-        finally:
-            # Flush whatever speech was in progress when the stream ended
-            # (e.g. caller hung up mid-sentence) instead of discarding it.
-            if utterance_frames:
-                async for text in _flush(utterance_frames):
-                    yield text
+        if resample_poly is not None:
+            from math import gcd
+
+            audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            factor = gcd(source_rate, target_rate)
+            up = target_rate // factor
+            down = source_rate // factor
+            resampled = resample_poly(audio, up, down)
+            resampled = np.clip(resampled, -1.0, 1.0)
+            return (resampled * 32767.0).astype(np.int16).tobytes()
+
+        pcm_resampled, _ = audioop.ratecv(pcm_bytes, 2, 1, source_rate, target_rate, None)
+        return pcm_resampled
+
+    async def get_stream(self):
+        """Async generator consumed by the STT pipeline."""
+        while True:
+            chunk = await self.queue.get()
+            yield chunk
+
+    @classmethod
+    def twilio(cls) -> "PhoneStreamSource":
+        return cls(provider="twilio")
+
+    @classmethod
+    def telnyx(cls) -> "PhoneStreamSource":
+        return cls(provider="telnyx")
