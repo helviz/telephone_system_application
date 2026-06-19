@@ -39,7 +39,7 @@ class VoiceAssistant:
         self.on_turn_logged = on_turn_logged  #  Saved as instance variable
 
         self.stt = STTModule(
-            model_size="small",
+            model_size=None,
             lang=self.lang,
             preloaded_model=preloaded_whisper,
         )
