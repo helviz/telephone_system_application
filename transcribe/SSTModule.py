@@ -13,13 +13,14 @@ from Audio.AudioSource import AudioSource
 load_dotenv()
 
 # WebRTC VAD requires mono PCM16 frames at 8, 16, 32, or 48 kHz.
-# PhoneStreamSource normalizes phone audio to 16 kHz PCM16.
+# PhoneStreamSource normalizes Twilio/Telnyx phone audio to 16 kHz PCM16.
 SAMPLE_RATE = 16000
 FRAME_MS = 20
-FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2
+FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # int16 = 2 bytes
 
 
 def _env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    """Read an integer env var safely and optionally clamp it."""
     try:
         value = int(os.getenv(name, str(default)).strip())
     except Exception:
@@ -33,6 +34,7 @@ def _env_int(name: str, default: int, min_value: int | None = None, max_value: i
 
 
 def _env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
+    """Read a float env var safely and optionally clamp it."""
     try:
         value = float(os.getenv(name, str(default)).strip())
     except Exception:
@@ -45,15 +47,44 @@ def _env_float(name: str, default: float, min_value: float | None = None, max_va
     return value
 
 
-# Softer defaults for Swahili over narrowband phone audio.
-VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 1, 0, 3)
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# Defaults tuned for narrowband 8 kHz phone speech after upsampling to 16 kHz.
+# These can still be overridden from Hugging Face / Docker env variables.
+VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 2, 0, 3)
+
 END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 900, 200, 3000)
 END_SILENCE_FRAMES = max(1, END_SILENCE_MS // FRAME_MS)
-PADDING_MS = _env_int("STT_PADDING_MS", 500, 0, 2000)
+
+PADDING_MS = _env_int("STT_PADDING_MS", 400, 0, 2000)
 PADDING_FRAMES = max(1, PADDING_MS // FRAME_MS)
+
 MAX_UTTERANCE_MS = _env_int("STT_MAX_UTTERANCE_MS", 20_000, 1000, 120_000)
-MAX_UTTERANCE_FRAMES = MAX_UTTERANCE_MS // FRAME_MS
-MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 8000, 1600, 160000)
+MAX_UTTERANCE_FRAMES = max(1, MAX_UTTERANCE_MS // FRAME_MS)
+
+MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 12000, 1600, 160000)
+MIN_RMS = _env_float("STT_MIN_RMS", 0.008, 0.0, 1.0)
+
+# Extra protection against Whisper hallucinating common phrases on silence/noise.
+# The length gate means real longer utterances containing these words are not blocked.
+HALLUCINATION_MAX_SAMPLES = _env_int("STT_HALLUCINATION_MAX_SAMPLES", 24000, 1600, 160000)
+BAD_SILENCE_PHRASES = {
+    "thank you",
+    "thank you.",
+    "thanks",
+    "thanks.",
+    "you",
+    "you.",
+    "asante",
+    "asante.",
+    "merci",
+    "merci.",
+}
 
 
 class STTModule:
@@ -67,22 +98,46 @@ class STTModule:
         if preloaded_model is not None:
             self.model = preloaded_model
             print(f"[STT] ♻️  Reusing preloaded Whisper model for [{lang}]")
-        else:
-            resolved_size = model_size or os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
-            resolved_device = device or os.getenv("WHISPER_DEVICE", "cpu").strip()
-            compute_type = "float16" if resolved_device == "cuda" else "int8"
+            return
 
-            print(f"[STT] 📦 Loading Whisper [{resolved_size}] on [{resolved_device}]...")
-            self.model = WhisperModel(
-                resolved_size,
-                device=resolved_device,
-                compute_type=compute_type,
-                download_root=os.getenv("HF_HOME"),
-            )
+        resolved_size = model_size or os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
+        resolved_device = device or os.getenv("WHISPER_DEVICE", "cpu").strip()
+        compute_type = "float16" if resolved_device == "cuda" else "int8"
+
+        print(f"[STT] 📦 Loading Whisper [{resolved_size}] on [{resolved_device}]...")
+        self.model = WhisperModel(
+            resolved_size,
+            device=resolved_device,
+            compute_type=compute_type,
+            download_root=os.getenv("HF_HOME"),
+        )
+
+    @staticmethod
+    def _rms(audio_data: np.ndarray) -> float:
+        if audio_data.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(audio_data))))
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return " ".join(text.strip().lower().split())
+
+    def _is_likely_silence_hallucination(self, text: str, audio_len_samples: int, rms: float) -> bool:
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return True
+
+        # Whisper often emits these on silence/noise. Only suppress them for short
+        # and low-energy clips so genuine user speech is not removed.
+        if normalized in BAD_SILENCE_PHRASES:
+            if audio_len_samples <= HALLUCINATION_MAX_SAMPLES or rms < (MIN_RMS * 1.5):
+                return True
+
+        return False
 
     def _transcribe_blocking(self, audio_data: np.ndarray) -> list[str]:
         try:
-            use_whisper_vad = os.getenv("WHISPER_INTERNAL_VAD", "false").strip().lower() == "true"
+            use_whisper_vad = _env_bool("WHISPER_INTERNAL_VAD", False)
 
             kwargs = {
                 "language": self.lang,
@@ -107,7 +162,8 @@ class STTModule:
             return []
 
     @staticmethod
-    def _frame_generator(byte_stream_buffer: bytearray):
+    def _frame_generator(byte_stream_buffer: bytearray) -> list[bytes]:
+        """Consume complete 20 ms PCM16 frames and keep any partial remainder."""
         frames = []
         offset = 0
         while offset + FRAME_BYTES <= len(byte_stream_buffer):
@@ -126,8 +182,10 @@ class STTModule:
     async def transcribe_stream(self, audio_source: AudioSource):
         print(
             f"--- STT Active: Listening [{self.lang}] "
-            f"VAD={VAD_AGGRESSIVENESS}, silence={END_SILENCE_MS}ms, padding={PADDING_MS}ms ---"
+            f"VAD={VAD_AGGRESSIVENESS}, silence={END_SILENCE_MS}ms, "
+            f"padding={PADDING_MS}ms, min_samples={MIN_SAMPLES}, min_rms={MIN_RMS} ---"
         )
+
         loop = asyncio.get_running_loop()
         vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
@@ -147,18 +205,29 @@ class STTModule:
             if len(audio_data) < MIN_SAMPLES:
                 return
 
+            rms = self._rms(audio_data)
+            if rms < MIN_RMS:
+                return
+
             t0 = time.time()
             texts = await loop.run_in_executor(None, self._transcribe_blocking, audio_data)
             stt_elapsed = time.time() - t0
 
-            if texts:
+            cleaned_texts: list[str] = []
+            for text in texts:
+                if self._is_likely_silence_hallucination(text, len(audio_data), rms):
+                    print(f"[STT] 🧹 Dropped likely silence hallucination: {text!r} | rms={rms:.5f}")
+                    continue
+                cleaned_texts.append(text)
+
+            if cleaned_texts:
                 try:
                     import stats
                     stats.record_stt_latency(stt_elapsed)
                 except Exception:
                     pass
 
-            for text in texts:
+            for text in cleaned_texts:
                 yield text
 
         try:
