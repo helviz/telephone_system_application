@@ -103,7 +103,12 @@ class GGUFStrategy(LLMStrategy):
         def get_stream():
             return self.llm.create_chat_completion(
                 messages=cast(Any, messages),
-                stream=True
+                stream=True,
+                max_tokens=50,
+                temperature=0.4,
+                top_p=0.85,
+                repeat_penalty=1.30,
+                stop=["<|im_end|>", "User:", "Assistant:"],
             )
 
         # Offloads the blocking synchronous create_chat_completion generator generator loops safely
