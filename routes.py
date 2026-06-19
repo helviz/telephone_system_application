@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from html import escape
+from urllib.parse import quote
 from flask import Flask, request, Response, abort, render_template_string
 from twilio.twiml.voice_response import VoiceResponse, Connect, Gather
 from twilio.request_validator import RequestValidator
@@ -30,6 +31,12 @@ HELP_GREETINGS = {
     "en": "How can I help you?",
     "fr": "Comment puis-je vous aider?",
     "sw": "Nawezaje kukusaidia?",
+}
+
+LANGUAGE_SELECTED_PROMPTS = {
+    "en": "English selected. How can I help you?",
+    "fr": "French selected. Comment puis-je vous aider?",
+    "sw": "Swahili selected. Nawezaje kukusaidia?",
 }
 
 IVR_GREETING = (
@@ -62,6 +69,78 @@ def _telnyx_say(text: str, lang: str = "en") -> str:
         f'{escape(text)}'
         f'</Say>'
     )
+
+
+def _caller_param_from_request() -> str:
+    """Return a URL-safe caller value for media-stream query parameters."""
+    return quote(request.form.get("From", "UNKNOWN"), safe="")
+
+
+def _media_stream_url(provider: str, lang: str) -> str:
+    """Build the websocket URL used by Twilio and Telnyx media streams."""
+    return f"wss://{_public_host()}/media-stream/{provider}/{lang}?From={_caller_param_from_request()}"
+
+
+def _twilio_gather(prompt: str, action: str = "/twilio/language") -> Gather:
+    """Build a Twilio single-digit language Gather with a spoken prompt."""
+    gather = Gather(
+        num_digits=1,
+        action=action,
+        method="POST",
+        timeout=10,
+        finish_on_key="",
+    )
+    gather.say(prompt, voice="Polly.Joanna-Neural")
+    return gather
+
+
+def _twilio_language_menu_response(prompt: str, redirect_to: str = "/twilio/voice") -> Response:
+    """Return TwiML that repeats the language menu until a valid option is pressed."""
+    resp = VoiceResponse()
+    resp.append(_twilio_gather(prompt))
+    resp.redirect(redirect_to, method="POST")
+    return Response(str(resp), mimetype="text/xml")
+
+
+def _twilio_stream_response(lang: str) -> Response:
+    """Confirm language selection, then connect the call to the Twilio stream."""
+    resp = VoiceResponse()
+    resp.say(LANGUAGE_SELECTED_PROMPTS[lang], voice="Polly.Joanna-Neural")
+
+    connect = Connect()
+    connect.stream(url=_media_stream_url("twilio", lang))
+    resp.append(connect)
+    return Response(str(resp), mimetype="text/xml")
+
+
+def _telnyx_language_menu_response(prompt: str) -> Response:
+    """Return TeXML that repeats the Telnyx language menu until a digit is received."""
+    host = escape(_public_host())
+    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="10">
+        {_telnyx_say(prompt, "en")}
+    </Gather>
+    <Redirect method="POST">https://{host}/telnyx/voice</Redirect>
+</Response>"""
+    return Response(texml, mimetype="text/xml")
+
+
+def _telnyx_stream_response(lang: str) -> Response:
+    """Confirm language selection, then open the Telnyx bidirectional stream."""
+    stream_url = escape(_media_stream_url("telnyx", lang))
+    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    {_telnyx_say(LANGUAGE_SELECTED_PROMPTS[lang], lang)}
+    <Stream
+        url="{stream_url}"
+        track="inbound_track"
+        codec="PCMU"
+        bidirectionalMode="rtp"
+        bidirectionalCodec="PCMU" />
+    <Pause length="3600"/>
+</Response>"""
+    return Response(texml, mimetype="text/xml")
 
 
 def _get_db_connection():
@@ -456,21 +535,7 @@ def metrics():
 @app.route("/twilio/voice", methods=["POST"])
 def twilio_voice():
     _validate_twilio()
-
-    resp = VoiceResponse()
-    gather = Gather(
-        num_digits=1,
-        action="/twilio/language",
-        method="POST",
-        timeout=10,
-        finish_on_key="",
-    )
-    # Use premium neural voice to present initial language options
-    gather.say(IVR_GREETING, voice="Polly.Joanna-Neural")
-    resp.append(gather)
-    resp.redirect("/twilio/voice", method="POST")
-
-    return Response(str(resp), mimetype="text/xml")
+    return _twilio_language_menu_response(IVR_GREETING)
 
 
 @app.route("/twilio/language", methods=["POST"])
@@ -478,38 +543,12 @@ def twilio_language():
     _validate_twilio()
 
     digit = request.form.get("Digits", "")
-    host = _public_host()
-
     if digit not in LANG_MAP:
-        resp = VoiceResponse()
-        gather = Gather(
-            num_digits=1,
-            action="/twilio/language",
-            method="POST",
-            timeout=10,
-            finish_on_key="",
-        )
-        gather.say(IVR_INVALID, voice="Polly.Joanna-Neural")
-        resp.append(gather)
-        resp.redirect("/twilio/voice", method="POST")
-        return Response(str(resp), mimetype="text/xml")
+        return _twilio_language_menu_response(IVR_INVALID)
 
     lang, lang_name = LANG_MAP[digit]
     print(f"[Twilio IVR] Caller selected: {lang_name} ({lang})")
-
-    resp = VoiceResponse()
-
-    # Do not play a second <Say> after language selection. Some Twilio voice /
-    # language combinations can fail before <Connect><Stream> is reached, which
-    # causes French or Swahili calls to end immediately after IVR selection.
-    # Connect directly to the media stream; the assistant/TTS layer handles the
-    # spoken response after the websocket opens.
-    connect = Connect()
-    caller = request.form.get("From", "UNKNOWN")
-    connect.stream(url=f"wss://{host}/media-stream/twilio/{lang}?From={caller}")
-    resp.append(connect)
-
-    return Response(str(resp), mimetype="text/xml")
+    return _twilio_stream_response(lang)
 
 
 # ===========================================================================
@@ -518,47 +557,19 @@ def twilio_language():
 
 @app.route("/telnyx/voice", methods=["POST"])
 def telnyx_voice():
-    host = _public_host()
-    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="10">
-        {_telnyx_say(IVR_GREETING, "en")}
-    </Gather>
-    <Redirect method="POST">https://{host}/telnyx/voice</Redirect>
-</Response>"""
-    return Response(texml, mimetype="text/xml")
+    return _telnyx_language_menu_response(IVR_GREETING)
+
 
 @app.route("/telnyx/language", methods=["POST"])
 def telnyx_language():
     digit = request.form.get("Digits", "")
-    host = _public_host()
-
     if digit not in LANG_MAP:
-        texml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="10">
-        {_telnyx_say(IVR_INVALID, "en")}
-    </Gather>
-    <Redirect method="POST">https://{host}/telnyx/voice</Redirect>
-</Response>"""
-        return Response(texml, mimetype="text/xml")
+        return _telnyx_language_menu_response(IVR_INVALID)
 
     lang, lang_name = LANG_MAP[digit]
     print(f"[Telnyx IVR] Caller selected: {lang_name} ({lang})")
+    return _telnyx_stream_response(lang)
 
-    caller = request.form.get("From", "UNKNOWN")
-    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    {_telnyx_say(HELP_GREETINGS[lang], lang)}
-    <Stream 
-        url="wss://{host}/media-stream/telnyx/{lang}?From={escape(caller)}"
-        track="inbound_track"
-        codec="PCMU"
-        bidirectionalMode="rtp"
-        bidirectionalCodec="PCMU" />
-    <Pause length="3600"/>
-</Response>"""
-    return Response(texml, mimetype="text/xml")
 
 # ===========================================================================
 # Health check
