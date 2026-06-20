@@ -57,27 +57,51 @@ def _load_models():
     print(f"   ✅ Faster-Whisper loaded on {resolved_device} in {time.time() - t:.1f}s\n")
 
     # ------------------------------------------------------------------
-    # TTS — MMS-TTS Models
+    # TTS — Kokoro for English/French, Facebook MMS for Swahili
     # ------------------------------------------------------------------
-    print("📦 [2/3] Loading MMS-TTS engines...")
+    print("📦 [2/3] Loading TTS: Kokoro(en/fr: af_heart) + MMS(sw)...")
     t = time.time()
     from transformers import VitsModel, AutoTokenizer
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    tts_configs = {
-        "en": "facebook/mms-tts-eng",
-        "fr": "facebook/mms-tts-fra",
-        "sw": "facebook/mms-tts-swh",
-    }
+    try:
+        from kokoro import KPipeline
+    except Exception as exc:
+        print(
+            "   ❌ Kokoro failed to import. Add `kokoro==0.9.4` to requirements.txt "
+            "and rebuild/redeploy the app."
+        )
+        raise exc
 
-    for lang, m_name in tts_configs.items():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # English and French use Kokoro with the requested af_heart voice.
+    # af_heart is an American-English voice, so lang_code='a' is used for both.
+    # For native French pronunciation later, use a French Kokoro voice + lang_code='f'.
+    for lang in ("en", "fr"):
         lt = time.time()
-        print(f"   Mapping language slot [{lang}] via {m_name}...")
-        tok = AutoTokenizer.from_pretrained(m_name)
-        mod = VitsModel.from_pretrained(m_name).to(device)
-        mod.eval()
-        _preloaded_tts[lang] = (mod, tok)
-        print(f"   ✅ Language component [{lang}] synchronized — {time.time() - lt:.1f}s")
+        print(f"   Loading language slot [{lang}] via Kokoro voice af_heart...")
+        pipeline = KPipeline(lang_code="a")
+        _preloaded_tts[lang] = {
+            "engine": "kokoro",
+            "pipeline": pipeline,
+            "voice": "af_heart",
+            "sample_rate": 24000,
+        }
+        print(f"   ✅ Language component [{lang}] Kokoro ready — {time.time() - lt:.1f}s")
+
+    # Swahili remains Facebook MMS exactly as before.
+    lt = time.time()
+    sw_model_name = "facebook/mms-tts-swh"
+    print(f"   Loading language slot [sw] via {sw_model_name}...")
+    sw_tokenizer = AutoTokenizer.from_pretrained(sw_model_name)
+    sw_model = VitsModel.from_pretrained(sw_model_name).to(device)
+    sw_model.eval()
+    _preloaded_tts["sw"] = {
+        "engine": "mms",
+        "model": sw_model,
+        "tokenizer": sw_tokenizer,
+    }
+    print(f"   ✅ Language component [sw] MMS ready — {time.time() - lt:.1f}s")
 
     print(f"   ✅ All TTS configurations allocated on {device} — {time.time() - t:.1f}s\n")
 
