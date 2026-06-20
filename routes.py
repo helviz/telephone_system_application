@@ -127,25 +127,13 @@ def _telnyx_language_menu_response(prompt: str) -> Response:
 
 
 def _telnyx_stream_response(lang: str) -> Response:
-    """Confirm language selection, then open the Telnyx bidirectional stream."""
+    """Confirm language selection, then open the Telnyx stream using the old working TeXML style."""
     stream_url = escape(_media_stream_url("telnyx", lang))
-    host = escape(_public_host())
 
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    {_telnyx_say(LANGUAGE_SELECTED_PROMPTS[lang], lang)}
-    <Start>
-        <Stream
-            url="{stream_url}"
-            track="inbound_track"
-            codec="PCMU"
-            bidirectionalMode="rtp"
-            bidirectionalCodec="PCMU"
-            bidirectionalSamplingRate="8000"
-            statusCallback="https://{host}/telnyx/stream-status"
-            statusCallbackMethod="POST" />
-    </Start>
-    <Pause length="3600"/>
+    {_telnyx_say(HELP_GREETINGS[lang], lang)}
+    <Stream url="{stream_url}" />
 </Response>"""
     return Response(texml, mimetype="text/xml")
 
