@@ -129,15 +129,22 @@ def _telnyx_language_menu_response(prompt: str) -> Response:
 def _telnyx_stream_response(lang: str) -> Response:
     """Confirm language selection, then open the Telnyx bidirectional stream."""
     stream_url = escape(_media_stream_url("telnyx", lang))
+    host = escape(_public_host())
+
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     {_telnyx_say(LANGUAGE_SELECTED_PROMPTS[lang], lang)}
-    <Stream
-        url="{stream_url}"
-        track="inbound_track"
-        codec="PCMU"
-        bidirectionalMode="rtp"
-        bidirectionalCodec="PCMU" />
+    <Start>
+        <Stream
+            url="{stream_url}"
+            track="inbound_track"
+            codec="PCMU"
+            bidirectionalMode="rtp"
+            bidirectionalCodec="PCMU"
+            bidirectionalSamplingRate="8000"
+            statusCallback="https://{host}/telnyx/stream-status"
+            statusCallbackMethod="POST" />
+    </Start>
     <Pause length="3600"/>
 </Response>"""
     return Response(texml, mimetype="text/xml")
@@ -569,6 +576,12 @@ def telnyx_language():
     lang, lang_name = LANG_MAP[digit]
     print(f"[Telnyx IVR] Caller selected: {lang_name} ({lang})")
     return _telnyx_stream_response(lang)
+
+
+@app.route("/telnyx/stream-status", methods=["POST"])
+def telnyx_stream_status():
+    print("[Telnyx Stream Status]", dict(request.form))
+    return Response("", status=204)
 
 
 # ===========================================================================
