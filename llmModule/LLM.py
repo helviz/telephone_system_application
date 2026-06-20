@@ -236,6 +236,21 @@ class LLM:
 
         )}
 
+
+    @staticmethod
+    def _with_qwen_no_think(prompt: str) -> str:
+        """Prepends Qwen no-think control instructions for low-latency voice output."""
+        prompt = (prompt or "").strip()
+        if "/no_think" in prompt.lower():
+            return prompt
+        return (
+            "/no_think\n"
+            "Do not output hidden reasoning. "
+            "Do not output <think> or </think>. "
+            "Give only the final spoken answer.\n\n"
+            + prompt
+        )
+
     @staticmethod
     def get_model(provider="gguf", lang="en"):
         prompt = LLM.SYSTEM_PROMPTS.get(lang, LLM.SYSTEM_PROMPTS["en"])
@@ -259,6 +274,9 @@ class LLM:
 
         elif normalized_provider == "gguf":
             from llmModule.GGUFStrategy import GGUFStrategy
+
+            # Qwen no-think mode: keep voice responses fast and prevent <think> leakage.
+            prompt = LLM._with_qwen_no_think(prompt)
 
             local_path = os.getenv("LOCAL_MODEL_PATH")
             if not local_path and not os.getenv("GGUF_MODEL"):
