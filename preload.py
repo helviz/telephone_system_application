@@ -3,12 +3,11 @@ import sys
 import time
 
 """
-Loads all three model families into memory so the first caller never waits:
+Loads all model families into memory so the first caller never waits:
 
-    STT  — Faster-Whisper medium (all three languages share one model)
-    TTS  — Facebook MMS-TTS  (en / fr / sw — three separate VITS models)
-    LLM  — GGUF via llama.cpp singleton (reads GGUF_MODEL env var)
-
+    STT  — Faster-Whisper, shared by all languages
+    TTS  — Kokoro for English/French using af_heart; Facebook MMS for Swahili
+    LLM  — GGUF via llama.cpp singleton, when local provider is enabled
 """
 
 print("\n" + "=" * 60)
@@ -18,15 +17,15 @@ print("=" * 60 + "\n")
 total_start = time.time()
 
 
-#STT — Faster-Whisper
-print("📦 [1/3] Loading Faster-Whisper (medium) ...")
+# STT — Faster-Whisper
+print("📦 [1/3] Loading Faster-Whisper ...")
 t = time.time()
 try:
     from faster_whisper import WhisperModel
 
-    whisper_device      = os.getenv("WHISPER_DEVICE", "cpu").strip()
-    whisper_model_size  = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
-    compute_type        = "float16" if whisper_device == "cuda" else "int8"
+    whisper_device = os.getenv("WHISPER_DEVICE", "cpu").strip()
+    whisper_model_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
+    compute_type = "float16" if whisper_device == "cuda" else "int8"
 
     _whisper = WhisperModel(
         whisper_model_size,
@@ -34,43 +33,60 @@ try:
         compute_type=compute_type,
         download_root=os.getenv("HF_HOME"),
     )
-    print(f"   ✅ Whisper [{whisper_model_size}] ready on [{whisper_device}] — {time.time()-t:.1f}s\n")
+    print(f"   ✅ Whisper [{whisper_model_size}] ready on [{whisper_device}] — {time.time() - t:.1f}s\n")
 except Exception as e:
     print(f"   ❌ Whisper failed to load: {e}")
     sys.exit(1)
 
 
-#TTS — Facebook MMS-TTS
-print("📦 [2/3] Loading Facebook MMS-TTS (en, fr, sw) ...")
+# TTS — Kokoro for en/fr, MMS for sw
+print("📦 [2/3] Loading TTS: Kokoro(en/fr: af_heart) + MMS(sw) ...")
 t = time.time()
 try:
-    from transformers import VitsModel, AutoTokenizer
     import torch
+    from transformers import VitsModel, AutoTokenizer
+    from kokoro import KPipeline
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    tts_models = {
-        "en": "facebook/mms-tts-eng",
-        "fr": "facebook/mms-tts-fra",
-        "sw": "facebook/mms-tts-swh",
-    }
 
     _tts_store = {}
-    for lang, model_name in tts_models.items():
-        lt = time.time()
-        print(f"   Loading {lang} → {model_name} ...")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model     = VitsModel.from_pretrained(model_name).to(device)
-        model.eval()
-        _tts_store[lang] = (model, tokenizer)
-        print(f"   ✅ {lang} ready — {time.time()-lt:.1f}s")
 
-    print(f"   ✅ All TTS models loaded on [{device}] — {time.time()-t:.1f}s\n")
+    # Kokoro: English and French use the same requested af_heart voice.
+    # af_heart is an American-English voice, so lang_code='a' is used for both.
+    # For native French pronunciation later, switch fr to lang_code='f' and a French voice.
+    for lang in ("en", "fr"):
+        lt = time.time()
+        print(f"   Loading {lang} → Kokoro voice af_heart ...")
+        pipeline = KPipeline(lang_code="a")
+        _tts_store[lang] = {
+            "engine": "kokoro",
+            "pipeline": pipeline,
+            "voice": "af_heart",
+            "sample_rate": 24000,
+        }
+        print(f"   ✅ {lang} Kokoro ready — {time.time() - lt:.1f}s")
+
+    # Swahili remains Facebook MMS exactly as before.
+    lt = time.time()
+    sw_model_name = "facebook/mms-tts-swh"
+    print(f"   Loading sw → {sw_model_name} ...")
+    sw_tokenizer = AutoTokenizer.from_pretrained(sw_model_name)
+    sw_model = VitsModel.from_pretrained(sw_model_name).to(device)
+    sw_model.eval()
+    _tts_store["sw"] = {
+        "engine": "mms",
+        "model": sw_model,
+        "tokenizer": sw_tokenizer,
+    }
+    print(f"   ✅ sw MMS ready — {time.time() - lt:.1f}s")
+
+    print(f"   ✅ All TTS engines loaded on [{device}] — {time.time() - t:.1f}s\n")
 except Exception as e:
     print(f"   ❌ TTS failed to load: {e}")
     sys.exit(1)
 
 
-#LLM — GGUF singleton (only if LLM_PROVIDER is configured for local running profiles)
+# LLM — GGUF singleton
 llm_provider = os.getenv("LLM_PROVIDER", "gguf").strip().lower()
 
 if llm_provider in ("qwen", "gguf", "local"):
@@ -78,9 +94,9 @@ if llm_provider in ("qwen", "gguf", "local"):
     t = time.time()
     try:
         from llmModule.LLM import LLM
-        # This triggers the factory initialization, parses URLs/Shorthands, and loads the singleton to system RAM
+
         LLM.get_model(provider="gguf", lang="en")
-        print(f"   ✅ GGUF Model successfully loaded and cached in RAM — {time.time()-t:.1f}s\n")
+        print(f"   ✅ GGUF Model successfully loaded and cached in RAM — {time.time() - t:.1f}s\n")
     except Exception as e:
         print(f"   ❌ GGUF LLM failed to preload: {e}")
         sys.exit(1)
