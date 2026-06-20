@@ -127,14 +127,16 @@ def _telnyx_language_menu_response(prompt: str) -> Response:
 
 
 def _telnyx_stream_response(lang: str) -> Response:
-    """Confirm language selection, then open the Telnyx stream using the old working TeXML style."""
-    stream_url = escape(_media_stream_url("telnyx", lang))
+    """Confirm language selection, then open the Telnyx stream using the exact old working TeXML style."""
+    host = _public_host()
+    caller = request.form.get("From", "UNKNOWN")
 
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    {_telnyx_say(HELP_GREETINGS[lang], lang)}
-    <Stream url="{stream_url}" />
+    <Say>{escape(HELP_GREETINGS[lang])}</Say>
+    <Stream url="wss://{escape(host)}/media-stream/telnyx/{escape(lang)}?From={quote(caller, safe='')}" />
 </Response>"""
+    print("[Telnyx TeXML /language]", texml)
     return Response(texml, mimetype="text/xml")
 
 
