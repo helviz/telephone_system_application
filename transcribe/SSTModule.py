@@ -54,7 +54,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# Defaults tuned for narrowband 8 kHz phone speech after upsampling to 16 kHz.
+# Defaults tuned for low-latency narrowband phone speech after upsampling to 16 kHz.
 # These can still be overridden from Hugging Face / Docker env variables.
 VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 1, 0, 3)
 
@@ -63,19 +63,19 @@ VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 1, 0, 3)
 #   2. FINAL_GRACE_MS waits a little longer before yielding text to the LLM.
 # If the caller resumes during the grace window, the pending flush is cancelled
 # and the new audio is merged into the same utterance.
-END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 1100, 200, 3000)
+END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 650, 200, 3000)
 END_SILENCE_FRAMES = max(1, END_SILENCE_MS // FRAME_MS)
 
-FINAL_GRACE_MS = _env_int("STT_FINAL_GRACE_MS", 700, 0, 3000)
+FINAL_GRACE_MS = _env_int("STT_FINAL_GRACE_MS", 250, 0, 3000)
 FINAL_GRACE_FRAMES = max(0, FINAL_GRACE_MS // FRAME_MS)
 
-PADDING_MS = _env_int("STT_PADDING_MS", 500, 0, 2000)
+PADDING_MS = _env_int("STT_PADDING_MS", 300, 0, 2000)
 PADDING_FRAMES = max(1, PADDING_MS // FRAME_MS)
 
 MAX_UTTERANCE_MS = _env_int("STT_MAX_UTTERANCE_MS", 20_000, 1000, 120_000)
 MAX_UTTERANCE_FRAMES = max(1, MAX_UTTERANCE_MS // FRAME_MS)
 
-MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 16000, 1600, 160000)
+MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 8000, 1600, 160000)
 MIN_RMS = _env_float("STT_MIN_RMS", 0.006, 0.0, 1.0)
 
 # Extra protection against Whisper hallucinating common phrases on silence/noise.
@@ -149,8 +149,8 @@ class STTModule:
 
             kwargs = {
                 "language": self.lang,
-                "beam_size": _env_int("WHISPER_BEAM_SIZE", 5, 1, 10),
-                "best_of": _env_int("WHISPER_BEST_OF", 5, 1, 10),
+                "beam_size": _env_int("WHISPER_BEAM_SIZE", 1, 1, 10),
+                "best_of": _env_int("WHISPER_BEST_OF", 1, 1, 10),
                 "condition_on_previous_text": False,
                 "vad_filter": use_whisper_vad,
                 "temperature": _env_float("WHISPER_TEMPERATURE", 0.0, 0.0, 1.0),
