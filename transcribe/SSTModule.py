@@ -56,19 +56,27 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 # Defaults tuned for narrowband 8 kHz phone speech after upsampling to 16 kHz.
 # These can still be overridden from Hugging Face / Docker env variables.
-VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 2, 0, 3)
+VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 1, 0, 3)
 
-END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 900, 200, 3000)
+# Two-stage turn finalization for phone calls:
+#   1. END_SILENCE_MS marks a possible end-of-speech.
+#   2. FINAL_GRACE_MS waits a little longer before yielding text to the LLM.
+# If the caller resumes during the grace window, the pending flush is cancelled
+# and the new audio is merged into the same utterance.
+END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 1100, 200, 3000)
 END_SILENCE_FRAMES = max(1, END_SILENCE_MS // FRAME_MS)
 
-PADDING_MS = _env_int("STT_PADDING_MS", 400, 0, 2000)
+FINAL_GRACE_MS = _env_int("STT_FINAL_GRACE_MS", 700, 0, 3000)
+FINAL_GRACE_FRAMES = max(0, FINAL_GRACE_MS // FRAME_MS)
+
+PADDING_MS = _env_int("STT_PADDING_MS", 500, 0, 2000)
 PADDING_FRAMES = max(1, PADDING_MS // FRAME_MS)
 
 MAX_UTTERANCE_MS = _env_int("STT_MAX_UTTERANCE_MS", 20_000, 1000, 120_000)
 MAX_UTTERANCE_FRAMES = max(1, MAX_UTTERANCE_MS // FRAME_MS)
 
-MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 12000, 1600, 160000)
-MIN_RMS = _env_float("STT_MIN_RMS", 0.008, 0.0, 1.0)
+MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 16000, 1600, 160000)
+MIN_RMS = _env_float("STT_MIN_RMS", 0.006, 0.0, 1.0)
 
 # Extra protection against Whisper hallucinating common phrases on silence/noise.
 # The length gate means real longer utterances containing these words are not blocked.
@@ -183,6 +191,7 @@ class STTModule:
         print(
             f"--- STT Active: Listening [{self.lang}] "
             f"VAD={VAD_AGGRESSIVENESS}, silence={END_SILENCE_MS}ms, "
+            f"final_grace={FINAL_GRACE_MS}ms, "
             f"padding={PADDING_MS}ms, min_samples={MIN_SAMPLES}, min_rms={MIN_RMS} ---"
         )
 
@@ -194,6 +203,8 @@ class STTModule:
         utterance_frames: list[bytes] = []
         in_speech = False
         trailing_silence = 0
+        maybe_done = False
+        grace_frames = 0
 
         async def _flush(frames: list[bytes]):
             if not frames:
@@ -246,31 +257,53 @@ class STTModule:
 
                     if not in_speech:
                         ring_pad.append(frame)
+
                         if is_speech:
                             in_speech = True
                             trailing_silence = 0
+                            maybe_done = False
+                            grace_frames = 0
+
+                            # Include a small amount of pre-speech padding so Whisper
+                            # does not lose the beginning of the caller's first word.
                             utterance_frames = list(ring_pad)
                             utterance_frames.append(frame)
+
                         continue
 
+                    # We are inside one caller utterance. Keep collecting frames until
+                    # both the normal silence threshold and the final grace window pass.
                     utterance_frames.append(frame)
 
                     if is_speech:
+                        # Caller resumed speech during silence/grace. This is the key
+                        # merge step: cancel the pending flush and keep the same buffer.
                         trailing_silence = 0
+                        maybe_done = False
+                        grace_frames = 0
                     else:
                         trailing_silence += 1
 
-                    should_flush = (
-                        trailing_silence >= END_SILENCE_FRAMES
-                        or len(utterance_frames) >= MAX_UTTERANCE_FRAMES
-                    )
+                    if trailing_silence >= END_SILENCE_FRAMES and not maybe_done:
+                        maybe_done = True
+                        grace_frames = 0
+                        print("[STT] Possible end of speech detected; entering final grace window.")
 
-                    if should_flush:
+                    if maybe_done:
+                        grace_frames += 1
+
+                    reached_max_length = len(utterance_frames) >= MAX_UTTERANCE_FRAMES
+                    grace_expired = maybe_done and grace_frames >= FINAL_GRACE_FRAMES
+
+                    if reached_max_length or grace_expired:
                         async for text in _flush(utterance_frames):
                             yield text
+
                         utterance_frames = []
                         in_speech = False
                         trailing_silence = 0
+                        maybe_done = False
+                        grace_frames = 0
                         ring_pad.clear()
 
         except asyncio.CancelledError:
