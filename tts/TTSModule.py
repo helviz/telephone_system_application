@@ -7,7 +7,8 @@ from transformers import VitsModel, AutoTokenizer
 
 MAX_BUFFER_CHARS = 200
 KOKORO_SAMPLE_RATE = 24000
-KOKORO_VOICE = "af_heart"
+# KOKORO_VOICE = "af_heart"
+KOKORO_VOICE = "am_adam"
 
 
 class TTSModule:
