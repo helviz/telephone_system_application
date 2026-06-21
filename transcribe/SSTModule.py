@@ -56,7 +56,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 # Defaults tuned for low-latency narrowband phone speech after upsampling to 16 kHz.
 # These can still be overridden from Hugging Face / Docker env variables.
-VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 1, 0, 3)
+VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 2, 0, 3)
 
 # Two-stage turn finalization for phone calls:
 #   1. END_SILENCE_MS marks a possible end-of-speech.
