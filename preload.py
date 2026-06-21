@@ -61,7 +61,7 @@ try:
         _tts_store[lang] = {
             "engine": "kokoro",
             "pipeline": pipeline,
-            "voice": "af_heart",
+            "voice": "am_adam",
             "sample_rate": 24000,
         }
         print(f"   ✅ {lang} Kokoro ready — {time.time() - lt:.1f}s")
