@@ -130,13 +130,13 @@ def _telnyx_stream_response(lang: str) -> Response:
     """Confirm language selection, then open Telnyx WebSocket stream."""
     host = escape(_public_host())
     caller = quote(request.form.get("From", "UNKNOWN"), safe="")
-    greeting = escape(HELP_GREETINGS[lang])
+    greeting_say = _telnyx_say(HELP_GREETINGS[lang], lang)
 
     stream_url = f"wss://{host}/media-stream/telnyx/{escape(lang)}?From={caller}"
 
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say>{greeting}</Say>
+    {greeting_say}
     <Connect>
         <Stream
             url="{stream_url}"
