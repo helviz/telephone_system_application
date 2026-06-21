@@ -137,13 +137,13 @@ def _telnyx_stream_response(lang: str) -> Response:
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say>{greeting}</Say>
-    <Start>
+    <Connect>
         <Stream
             url="{stream_url}"
+            bidirectionalMode="rtp"
             statusCallback="https://{host}/telnyx/stream-status"
             statusCallbackMethod="POST" />
-    </Start>
-    <Pause length="3600"/>
+    </Connect>
 </Response>"""
 
     print("[Telnyx TeXML /language]", texml)
