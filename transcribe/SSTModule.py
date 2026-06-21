@@ -112,7 +112,10 @@ class STTModule:
         resolved_device = device or os.getenv("WHISPER_DEVICE", "cpu").strip()
         compute_type = "float16" if resolved_device == "cuda" else "int8"
 
-        print(f"[STT] 📦 Loading Whisper [{resolved_size}] on [{resolved_device}]...")
+        print(
+            f"[STT] 📦 Loading Whisper [{resolved_size}] on [{resolved_device}] "
+            f"(compute_type={compute_type})..."
+        )
         self.model = WhisperModel(
             resolved_size,
             device=resolved_device,
@@ -205,24 +208,45 @@ class STTModule:
         trailing_silence = 0
         maybe_done = False
         grace_frames = 0
+        grace_resets = 0
 
         async def _flush(frames: list[bytes]):
+            t_flush_start = time.time()
             if not frames:
                 return
 
             audio_bytes = b"".join(frames)
             audio_data = self._bytes_to_float_audio(audio_bytes)
+            utterance_ms = len(audio_data) / SAMPLE_RATE * 1000
 
             if len(audio_data) < MIN_SAMPLES:
+                print(
+                    f"[STT][{t_flush_start:.3f}] Flush skipped: below MIN_SAMPLES "
+                    f"({len(audio_data)} < {MIN_SAMPLES}, {utterance_ms:.0f}ms audio)"
+                )
                 return
 
             rms = self._rms(audio_data)
             if rms < MIN_RMS:
+                print(
+                    f"[STT][{t_flush_start:.3f}] Flush skipped: below MIN_RMS "
+                    f"(rms={rms:.5f} < {MIN_RMS}, {utterance_ms:.0f}ms audio)"
+                )
                 return
+
+            print(
+                f"[STT][{t_flush_start:.3f}] Flush start: {utterance_ms:.0f}ms audio, "
+                f"rms={rms:.5f} — invoking Whisper..."
+            )
 
             t0 = time.time()
             texts = await loop.run_in_executor(None, self._transcribe_blocking, audio_data)
             stt_elapsed = time.time() - t0
+
+            print(
+                f"[STT][{time.time():.3f}] Whisper transcribe done in {stt_elapsed:.3f}s "
+                f"(total flush-to-text: {time.time() - t_flush_start:.3f}s) -> {texts!r}"
+            )
 
             cleaned_texts: list[str] = []
             for text in texts:
@@ -263,6 +287,9 @@ class STTModule:
                             trailing_silence = 0
                             maybe_done = False
                             grace_frames = 0
+                            grace_resets = 0
+                            t_speech_start = time.time()
+                            print(f"[STT][{t_speech_start:.3f}] Speech start detected.")
 
                             # Include a small amount of pre-speech padding so Whisper
                             # does not lose the beginning of the caller's first word.
@@ -278,6 +305,12 @@ class STTModule:
                     if is_speech:
                         # Caller resumed speech during silence/grace. This is the key
                         # merge step: cancel the pending flush and keep the same buffer.
+                        if maybe_done:
+                            grace_resets += 1
+                            print(
+                                f"[STT][{time.time():.3f}] Speech resumed during grace window "
+                                f"(reset #{grace_resets}) — restarting {END_SILENCE_MS}ms silence count."
+                            )
                         trailing_silence = 0
                         maybe_done = False
                         grace_frames = 0
@@ -287,7 +320,10 @@ class STTModule:
                     if trailing_silence >= END_SILENCE_FRAMES and not maybe_done:
                         maybe_done = True
                         grace_frames = 0
-                        print("[STT] Possible end of speech detected; entering final grace window.")
+                        print(
+                            f"[STT][{time.time():.3f}] Possible end of speech detected "
+                            f"(after {grace_resets} prior reset(s)); entering final grace window."
+                        )
 
                     if maybe_done:
                         grace_frames += 1
@@ -296,6 +332,11 @@ class STTModule:
                     grace_expired = maybe_done and grace_frames >= FINAL_GRACE_FRAMES
 
                     if reached_max_length or grace_expired:
+                        reason = "max_length" if reached_max_length else "grace_expired"
+                        print(
+                            f"[STT][{time.time():.3f}] Flush triggered ({reason}), "
+                            f"{len(utterance_frames)} frames, {grace_resets} grace reset(s) total."
+                        )
                         async for text in _flush(utterance_frames):
                             yield text
 
@@ -304,6 +345,7 @@ class STTModule:
                         trailing_silence = 0
                         maybe_done = False
                         grace_frames = 0
+                        grace_resets = 0
                         ring_pad.clear()
 
         except asyncio.CancelledError:
