@@ -6,7 +6,7 @@ import time
 Loads all model families into memory so the first caller never waits:
 
     STT  — Faster-Whisper, shared by all languages
-    TTS  — Kokoro for English/French using af_heart; Facebook MMS for Swahili
+    TTS  — Kokoro en=af_heart, fr=ff_siwis; OmniVoice for Swahili
     LLM  — GGUF via llama.cpp singleton, when local provider is enabled
 """
 
@@ -39,46 +39,54 @@ except Exception as e:
     sys.exit(1)
 
 
-# TTS — Kokoro for en/fr, MMS for sw
-print("📦 [2/3] Loading TTS: Kokoro(en/fr: af_heart) + MMS(sw) ...")
+# TTS — Kokoro for en/fr, OmniVoice for sw
+print("📦 [2/3] Loading TTS: Kokoro(en=af_heart, fr=ff_siwis) + OmniVoice(sw) ...")
 t = time.time()
 try:
     import torch
-    from transformers import VitsModel, AutoTokenizer
     from kokoro import KPipeline
+    from omnivoice import OmniVoice
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    device_map = "cuda:0" if device == "cuda" else "cpu"
 
     _tts_store = {}
 
-    # Kokoro: English and French use the same requested af_heart voice.
-    # af_heart is an American-English voice, so lang_code='a' is used for both.
-    # For native French pronunciation later, switch fr to lang_code='f' and a French voice.
-    for lang in ("en", "fr"):
+    kokoro_slots = {
+        "en": {"voice": "af_heart", "lang_code": "a"},
+        "fr": {"voice": "ff_siwis", "lang_code": "f"},
+    }
+
+    for lang, cfg in kokoro_slots.items():
         lt = time.time()
-        print(f"   Loading {lang} → Kokoro voice af_heart ...")
-        pipeline = KPipeline(lang_code="a")
+        print(f"   Loading {lang} → Kokoro voice {cfg['voice']} ...")
         _tts_store[lang] = {
             "engine": "kokoro",
-            "pipeline": pipeline,
-            "voice": "am_adam",
+            "pipeline": KPipeline(lang_code=cfg["lang_code"]),
+            "voice": cfg["voice"],
             "sample_rate": 24000,
         }
         print(f"   ✅ {lang} Kokoro ready — {time.time() - lt:.1f}s")
 
-    # Swahili remains Facebook MMS exactly as before.
     lt = time.time()
-    sw_model_name = "facebook/mms-tts-swh"
+    sw_model_name = "k2-fsa/OmniVoice"
     print(f"   Loading sw → {sw_model_name} ...")
-    sw_tokenizer = AutoTokenizer.from_pretrained(sw_model_name)
-    sw_model = VitsModel.from_pretrained(sw_model_name).to(device)
-    sw_model.eval()
+    sw_model = OmniVoice.from_pretrained(
+        sw_model_name,
+        device_map=device_map,
+        dtype=dtype,
+    )
     _tts_store["sw"] = {
-        "engine": "mms",
+        "engine": "omnivoice",
         "model": sw_model,
-        "tokenizer": sw_tokenizer,
+        "sample_rate": 24000,
+        "instruct": "female, middle-aged, moderate pitch",
+        "num_step": 16,
+        "speed": 1.0,
+        "language_id": "sw",
     }
-    print(f"   ✅ sw MMS ready — {time.time() - lt:.1f}s")
+    print(f"   ✅ sw OmniVoice ready — {time.time() - lt:.1f}s")
 
     print(f"   ✅ All TTS engines loaded on [{device}] — {time.time() - t:.1f}s\n")
 except Exception as e:
