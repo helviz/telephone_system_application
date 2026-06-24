@@ -1,10 +1,12 @@
 import os
+import random
 import sys
 import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.wsgi import WSGIMiddleware
@@ -20,6 +22,27 @@ import database  # persistent layer — tables created on import
 load_dotenv()
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gguf").strip().lower()
+
+
+def seed_omnivoice(seed: int | None = None) -> int:
+    """Seed RNGs before loading/generating with OmniVoice."""
+    seed = int(seed if seed is not None else os.getenv("OMNIVOICE_SEED", "12345"))
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    except Exception:
+        pass
+
+    return seed
+
 
 # ---------------------------------------------------------------------------
 # In-process model store — populated by lifespan, read by WebSocket handler
@@ -83,6 +106,8 @@ def _load_models():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
     device_map = "cuda:0" if device == "cuda" else "cpu"
+    omnivoice_seed = seed_omnivoice()
+    print(f"   🎚️  OmniVoice deterministic seed: {omnivoice_seed}")
 
     kokoro_slots = {
         "en": {"voice": "af_heart", "lang_code": "a"},
@@ -103,6 +128,7 @@ def _load_models():
     lt = time.time()
     sw_model_name = "k2-fsa/OmniVoice"
     print(f"   Loading language slot [sw] via {sw_model_name}...")
+    seed_omnivoice(omnivoice_seed)
     sw_model = OmniVoice.from_pretrained(
         sw_model_name,
         device_map=device_map,
@@ -116,6 +142,7 @@ def _load_models():
         "num_step": 16,
         "speed": 1.0,
         "language_id": "sw",
+        "seed": omnivoice_seed,
     }
     print(f"   ✅ Language component [sw] OmniVoice ready — {time.time() - lt:.1f}s")
 

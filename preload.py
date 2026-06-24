@@ -1,6 +1,9 @@
 import os
+import random
 import sys
 import time
+
+import numpy as np
 
 """
 Loads all model families into memory so the first caller never waits:
@@ -15,6 +18,27 @@ print("🔥 PRELOADING ALL MODELS — server will start after this")
 print("=" * 60 + "\n")
 
 total_start = time.time()
+
+def seed_omnivoice(seed: int | None = None) -> int:
+    """Seed RNGs before loading/generating with OmniVoice."""
+    import torch
+
+    seed = int(seed if seed is not None else os.getenv("OMNIVOICE_SEED", "12345"))
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    except Exception:
+        pass
+
+    return seed
 
 
 # STT — Faster-Whisper
@@ -50,6 +74,8 @@ try:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
     device_map = "cuda:0" if device == "cuda" else "cpu"
+    omnivoice_seed = seed_omnivoice()
+    print(f"   🎚️  OmniVoice deterministic seed: {omnivoice_seed}")
 
     _tts_store = {}
 
@@ -72,6 +98,7 @@ try:
     lt = time.time()
     sw_model_name = "k2-fsa/OmniVoice"
     print(f"   Loading sw → {sw_model_name} ...")
+    seed_omnivoice(omnivoice_seed)
     sw_model = OmniVoice.from_pretrained(
         sw_model_name,
         device_map=device_map,
@@ -85,6 +112,7 @@ try:
         "num_step": 16,
         "speed": 1.0,
         "language_id": "sw",
+        "seed": omnivoice_seed,
     }
     print(f"   ✅ sw OmniVoice ready — {time.time() - lt:.1f}s")
 

@@ -1,7 +1,11 @@
 import asyncio
+import os
+import random
+import threading
 import time
 from typing import Any
 
+import numpy as np
 import torch
 
 MAX_BUFFER_CHARS = 200
@@ -25,6 +29,46 @@ OMNIVOICE_INSTRUCT = "female, middle-aged, moderate pitch"
 OMNIVOICE_NUM_STEP = 16
 OMNIVOICE_SPEED = 1.0
 OMNIVOICE_LANGUAGE_ID = "sw"
+
+# Keep OmniVoice voice-design output stable across calls/restarts.
+# You can override this in Hugging Face Space secrets/env vars.
+OMNIVOICE_SEED = int(os.getenv("OMNIVOICE_SEED", "12345"))
+
+
+def seed_omnivoice(seed: int = OMNIVOICE_SEED) -> int:
+    """Seed all RNGs OmniVoice may use during sampling/generation."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # These flags reduce CUDA/CuDNN nondeterminism. They do not make every
+    # possible GPU kernel bit-identical, but they remove the common source of
+    # voice-design drift between generations.
+    try:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    except Exception:
+        pass
+
+    return seed
+
+
+def _bundle_omnivoice_seed(bundle: dict[str, Any]) -> int:
+    return int(bundle.get("seed", OMNIVOICE_SEED))
+
+
+def _ensure_omnivoice_lock(bundle: dict[str, Any]) -> dict[str, Any]:
+    # A shared preloaded OmniVoice model uses global torch RNG state. The lock
+    # prevents two calls from reseeding/generating at the same time and changing
+    # each other's voice output.
+    if bundle.get("engine") == "omnivoice" and "lock" not in bundle:
+        bundle["lock"] = threading.Lock()
+    return bundle
 
 
 class TTSModule:
@@ -62,7 +106,7 @@ class TTSModule:
         crash the app during a rolling deployment.
         """
         if isinstance(bundle, dict):
-            return bundle
+            return _ensure_omnivoice_lock(bundle)
 
         if isinstance(bundle, tuple) and len(bundle) == 2:
             model, tokenizer = bundle
@@ -124,13 +168,14 @@ class TTSModule:
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         device_map = "cuda:0" if self.device == "cuda" else "cpu"
 
+        seed_omnivoice(OMNIVOICE_SEED)
         model = OmniVoice.from_pretrained(
             OMNIVOICE_MODEL_ID,
             device_map=device_map,
             dtype=dtype,
         )
 
-        return {
+        return _ensure_omnivoice_lock({
             "engine": "omnivoice",
             "model": model,
             "sample_rate": OMNIVOICE_SAMPLE_RATE,
@@ -138,7 +183,8 @@ class TTSModule:
             "num_step": OMNIVOICE_NUM_STEP,
             "speed": OMNIVOICE_SPEED,
             "language_id": OMNIVOICE_LANGUAGE_ID,
-        }
+            "seed": OMNIVOICE_SEED,
+        })
 
     async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
         bundle = self._ensure_model_loaded(lang)
@@ -236,12 +282,23 @@ class TTSModule:
         if language_id:
             kwargs["language_id"] = language_id
 
-        with torch.inference_mode():
-            try:
-                audio = model.generate(**kwargs)
-            except TypeError:
-                kwargs.pop("language_id", None)
-                audio = model.generate(**kwargs)
+        seed = _bundle_omnivoice_seed(bundle)
+        lock = bundle.get("lock")
+
+        def _run_generate():
+            seed_omnivoice(seed)
+            with torch.inference_mode():
+                try:
+                    return model.generate(**kwargs)
+                except TypeError:
+                    kwargs.pop("language_id", None)
+                    return model.generate(**kwargs)
+
+        if lock is not None:
+            with lock:
+                audio = _run_generate()
+        else:
+            audio = _run_generate()
 
         waveform = self._to_mono_tensor(audio)
         return waveform, int(bundle.get("sample_rate", OMNIVOICE_SAMPLE_RATE))
