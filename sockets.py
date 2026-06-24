@@ -57,11 +57,10 @@ def _load_models():
     print(f"   ✅ Faster-Whisper loaded on {resolved_device} in {time.time() - t:.1f}s\n")
 
     # ------------------------------------------------------------------
-    # TTS — Kokoro for English/French, Facebook MMS for Swahili
+    # TTS — Kokoro for English/French, OmniVoice for Swahili
     # ------------------------------------------------------------------
-    print("📦 [2/3] Loading TTS: Kokoro(en/fr: af_heart) + MMS(sw)...")
+    print("📦 [2/3] Loading TTS: Kokoro(en=af_heart, fr=ff_siwis) + OmniVoice(sw)...")
     t = time.time()
-    from transformers import VitsModel, AutoTokenizer
 
     try:
         from kokoro import KPipeline
@@ -72,36 +71,53 @@ def _load_models():
         )
         raise exc
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        from omnivoice import OmniVoice
+    except Exception as exc:
+        print(
+            "   ❌ OmniVoice failed to import. Add `omnivoice` to requirements.txt "
+            "and rebuild/redeploy the app."
+        )
+        raise exc
 
-    # English and French use Kokoro with the requested af_heart voice.
-    # af_heart is an American-English voice, so lang_code='a' is used for both.
-    # For native French pronunciation later, use a French Kokoro voice + lang_code='f'.
-    for lang in ("en", "fr"):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    device_map = "cuda:0" if device == "cuda" else "cpu"
+
+    kokoro_slots = {
+        "en": {"voice": "af_heart", "lang_code": "a"},
+        "fr": {"voice": "ff_siwis", "lang_code": "f"},
+    }
+
+    for lang, cfg in kokoro_slots.items():
         lt = time.time()
-        print(f"   Loading language slot [{lang}] via Kokoro voice af_heart...")
-        pipeline = KPipeline(lang_code="a")
+        print(f"   Loading language slot [{lang}] via Kokoro voice {cfg['voice']}...")
         _preloaded_tts[lang] = {
             "engine": "kokoro",
-            "pipeline": pipeline,
-            "voice": "af_heart",
+            "pipeline": KPipeline(lang_code=cfg["lang_code"]),
+            "voice": cfg["voice"],
             "sample_rate": 24000,
         }
         print(f"   ✅ Language component [{lang}] Kokoro ready — {time.time() - lt:.1f}s")
 
-    # Swahili remains Facebook MMS exactly as before.
     lt = time.time()
-    sw_model_name = "facebook/mms-tts-swh"
+    sw_model_name = "k2-fsa/OmniVoice"
     print(f"   Loading language slot [sw] via {sw_model_name}...")
-    sw_tokenizer = AutoTokenizer.from_pretrained(sw_model_name)
-    sw_model = VitsModel.from_pretrained(sw_model_name).to(device)
-    sw_model.eval()
+    sw_model = OmniVoice.from_pretrained(
+        sw_model_name,
+        device_map=device_map,
+        dtype=dtype,
+    )
     _preloaded_tts["sw"] = {
-        "engine": "mms",
+        "engine": "omnivoice",
         "model": sw_model,
-        "tokenizer": sw_tokenizer,
+        "sample_rate": 24000,
+        "instruct": "female, middle-aged, moderate pitch",
+        "num_step": 16,
+        "speed": 1.0,
+        "language_id": "sw",
     }
-    print(f"   ✅ Language component [sw] MMS ready — {time.time() - lt:.1f}s")
+    print(f"   ✅ Language component [sw] OmniVoice ready — {time.time() - lt:.1f}s")
 
     print(f"   ✅ All TTS configurations allocated on {device} — {time.time() - t:.1f}s\n")
 
