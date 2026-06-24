@@ -3,12 +3,28 @@ import time
 from typing import Any
 
 import torch
-from transformers import VitsModel, AutoTokenizer
 
 MAX_BUFFER_CHARS = 200
 KOKORO_SAMPLE_RATE = 24000
-# KOKORO_VOICE = "af_heart"
-KOKORO_VOICE = "am_adam"
+OMNIVOICE_SAMPLE_RATE = 24000
+
+KOKORO_VOICE_MAP = {
+    "en": "af_heart",
+    "fr": "ff_siwis",
+}
+
+# English uses Kokoro American English voice/pipeline. French uses the native
+# Kokoro French female voice and French pipeline.
+KOKORO_LANG_CODE_MAP = {
+    "en": "a",
+    "fr": "f",
+}
+
+OMNIVOICE_MODEL_ID = "k2-fsa/OmniVoice"
+OMNIVOICE_INSTRUCT = "female, middle-aged, moderate pitch"
+OMNIVOICE_NUM_STEP = 16
+OMNIVOICE_SPEED = 1.0
+OMNIVOICE_LANGUAGE_ID = "sw"
 
 
 class TTSModule:
@@ -16,8 +32,9 @@ class TTSModule:
     Streaming TTS module for phone calls.
 
     Language routing:
-      - en/fr: Kokoro TTS with voice af_heart
-      - sw: Facebook MMS TTS, unchanged
+      - en: Kokoro TTS with voice af_heart
+      - fr: Kokoro TTS with voice ff_siwis
+      - sw: OmniVoice voice-design mode using k2-fsa/OmniVoice
 
     The public interface is unchanged:
         await speak_stream(text_generator, lang="en", on_first_audio=callback)
@@ -27,44 +44,26 @@ class TTSModule:
         self.output = output
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # English and French now use Kokoro. Swahili stays on MMS.
-        # NOTE: af_heart is an English/American Kokoro voice. We use lang_code="a"
-        # for both en and fr because the user explicitly requested af_heart.
         self.engine_map = {
             "en": "kokoro",
             "fr": "kokoro",
-            "sw": "mms",
-        }
-        self.kokoro_voice_map = {
-            "en": KOKORO_VOICE,
-            "fr": KOKORO_VOICE,
-        }
-        self.kokoro_lang_code_map = {
-            "en": "a",  # American English
-            "fr": "a",  # keep af_heart as requested; use "f" only with a French voice
-        }
-        self.mms_model_map = {
-            "sw": "facebook/mms-tts-swh",
+            "sw": "omnivoice",
         }
 
-        # Cached runtime objects. Entries are normalized dictionaries:
-        #   {"engine": "kokoro", "pipeline": KPipeline(...), ...}
-        #   {"engine": "mms", "model": VitsModel(...), "tokenizer": AutoTokenizer(...)}
         self.models: dict[str, dict[str, Any]] = {}
-
         if preloaded_models:
             for lang, bundle in preloaded_models.items():
                 self.models[lang] = self._normalize_preloaded_bundle(lang, bundle)
 
     def _normalize_preloaded_bundle(self, lang: str, bundle: Any) -> dict[str, Any]:
         """
-        Accept both the old preload format `(model, tokenizer)` and the new
-        dictionary format used by preload.py after the Kokoro refactor.
+        Accept the new dictionary preload format plus older tuple MMS bundles.
+        The MMS tuple fallback is kept only so old cached/injected state does not
+        crash the app during a rolling deployment.
         """
         if isinstance(bundle, dict):
             return bundle
 
-        # Backwards compatibility: old code stored `(model, tokenizer)` for MMS.
         if isinstance(bundle, tuple) and len(bundle) == 2:
             model, tokenizer = bundle
             return {
@@ -76,9 +75,7 @@ class TTSModule:
         raise ValueError(f"Unsupported preloaded TTS bundle for lang={lang}: {type(bundle)}")
 
     def _ensure_model_loaded(self, lang: str) -> dict[str, Any]:
-        """
-        Lazily load only the TTS engine needed for the active language.
-        """
+        """Lazily load only the TTS engine needed for the active language."""
         if lang not in self.engine_map:
             raise ValueError(f"Unsupported TTS language: {lang}. Choose from {list(self.engine_map)}")
 
@@ -90,35 +87,58 @@ class TTSModule:
         t_load = time.time()
 
         if engine == "kokoro":
-            try:
-                from kokoro import KPipeline
-            except Exception as exc:
-                raise RuntimeError(
-                    "Kokoro is not installed. Add `kokoro` to requirements.txt "
-                    "or install it with `pip install kokoro`."
-                ) from exc
-
-            pipeline = KPipeline(lang_code=self.kokoro_lang_code_map[lang])
-            self.models[lang] = {
-                "engine": "kokoro",
-                "pipeline": pipeline,
-                "voice": self.kokoro_voice_map[lang],
-                "sample_rate": KOKORO_SAMPLE_RATE,
-            }
-
+            self.models[lang] = self._load_kokoro(lang)
+        elif engine == "omnivoice":
+            self.models[lang] = self._load_omnivoice()
         else:
-            repo_id = self.mms_model_map[lang]
-            tokenizer = AutoTokenizer.from_pretrained(repo_id)
-            model = VitsModel.from_pretrained(repo_id).to(self.device)
-            model.eval()
-            self.models[lang] = {
-                "engine": "mms",
-                "model": model,
-                "tokenizer": tokenizer,
-            }
+            raise ValueError(f"Unsupported TTS engine for lang={lang}: {engine}")
 
         print(f"[TTS] [{lang.upper()}] ready in {time.time() - t_load:.2f}s.\n")
         return self.models[lang]
+
+    def _load_kokoro(self, lang: str) -> dict[str, Any]:
+        try:
+            from kokoro import KPipeline
+        except Exception as exc:
+            raise RuntimeError(
+                "Kokoro is not installed. Add `kokoro==0.9.4` to requirements.txt "
+                "or install it with `pip install kokoro==0.9.4`."
+            ) from exc
+
+        return {
+            "engine": "kokoro",
+            "pipeline": KPipeline(lang_code=KOKORO_LANG_CODE_MAP[lang]),
+            "voice": KOKORO_VOICE_MAP[lang],
+            "sample_rate": KOKORO_SAMPLE_RATE,
+        }
+
+    def _load_omnivoice(self) -> dict[str, Any]:
+        try:
+            from omnivoice import OmniVoice
+        except Exception as exc:
+            raise RuntimeError(
+                "OmniVoice is not installed. Add `omnivoice` to requirements.txt "
+                "or install it from the official k2-fsa/OmniVoice package."
+            ) from exc
+
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        device_map = "cuda:0" if self.device == "cuda" else "cpu"
+
+        model = OmniVoice.from_pretrained(
+            OMNIVOICE_MODEL_ID,
+            device_map=device_map,
+            dtype=dtype,
+        )
+
+        return {
+            "engine": "omnivoice",
+            "model": model,
+            "sample_rate": OMNIVOICE_SAMPLE_RATE,
+            "instruct": OMNIVOICE_INSTRUCT,
+            "num_step": OMNIVOICE_NUM_STEP,
+            "speed": OMNIVOICE_SPEED,
+            "language_id": OMNIVOICE_LANGUAGE_ID,
+        }
 
     async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
         bundle = self._ensure_model_loaded(lang)
@@ -165,11 +185,13 @@ class TTSModule:
                 None,
                 lambda: self._synthesize_kokoro(text, bundle),
             )
-        else:
+        elif bundle["engine"] == "omnivoice":
             waveform, sample_rate = await loop.run_in_executor(
                 None,
-                lambda: self._synthesize_mms(text, bundle),
+                lambda: self._synthesize_omnivoice(text, bundle),
             )
+        else:
+            raise ValueError(f"Unsupported TTS engine: {bundle.get('engine')}")
 
         tts_elapsed = time.time() - t0
         try:
@@ -186,7 +208,7 @@ class TTSModule:
     def _synthesize_kokoro(self, text: str, bundle: dict[str, Any]) -> tuple[torch.Tensor, int]:
         generator = bundle["pipeline"](
             text,
-            voice=bundle.get("voice", KOKORO_VOICE),
+            voice=bundle.get("voice", KOKORO_VOICE_MAP["en"]),
             speed=0.95,
         )
 
@@ -195,6 +217,37 @@ class TTSModule:
             if audio is not None:
                 chunks.append(torch.as_tensor(audio, dtype=torch.float32))
 
+        waveform = self._concat_or_silence(chunks)
+        return waveform, int(bundle.get("sample_rate", KOKORO_SAMPLE_RATE))
+
+    def _synthesize_omnivoice(self, text: str, bundle: dict[str, Any]) -> tuple[torch.Tensor, int]:
+        model = bundle["model"]
+
+        kwargs = {
+            "text": text,
+            "instruct": bundle.get("instruct", OMNIVOICE_INSTRUCT),
+            "num_step": int(bundle.get("num_step", OMNIVOICE_NUM_STEP)),
+            "speed": float(bundle.get("speed", OMNIVOICE_SPEED)),
+        }
+
+        # OmniVoice supports language_id as an optional hint. Keep this separate
+        # so older package versions that do not accept it can still run.
+        language_id = bundle.get("language_id")
+        if language_id:
+            kwargs["language_id"] = language_id
+
+        with torch.inference_mode():
+            try:
+                audio = model.generate(**kwargs)
+            except TypeError:
+                kwargs.pop("language_id", None)
+                audio = model.generate(**kwargs)
+
+        waveform = self._to_mono_tensor(audio)
+        return waveform, int(bundle.get("sample_rate", OMNIVOICE_SAMPLE_RATE))
+
+    @staticmethod
+    def _concat_or_silence(chunks: list[torch.Tensor]) -> torch.Tensor:
         if not chunks:
             waveform = torch.zeros(1, 1, dtype=torch.float32)
         elif len(chunks) == 1:
@@ -202,19 +255,31 @@ class TTSModule:
         else:
             waveform = torch.cat(chunks, dim=-1)
 
-        # Keep the shape compatible with the existing PhoneAudioOutput path:
-        # torch tensor, mono, batch-like first dimension.
         if waveform.ndim == 1:
             waveform = waveform.unsqueeze(0)
+        return waveform.to(dtype=torch.float32, device="cpu")
 
-        return waveform, int(bundle.get("sample_rate", KOKORO_SAMPLE_RATE))
+    @staticmethod
+    def _to_mono_tensor(audio: Any) -> torch.Tensor:
+        """
+        Normalize OmniVoice outputs to the existing PhoneAudioOutput contract:
+        a CPU float32 tensor shaped as [1, samples].
+        """
+        if isinstance(audio, torch.Tensor):
+            waveform = audio.detach().to(dtype=torch.float32, device="cpu")
+        else:
+            waveform = torch.as_tensor(audio, dtype=torch.float32, device="cpu")
 
-    def _synthesize_mms(self, text: str, bundle: dict[str, Any]) -> tuple[torch.Tensor, int]:
-        model = bundle["model"]
-        tokenizer = bundle["tokenizer"]
+        # Common OmniVoice return shapes are [samples], [1, samples], or a batch
+        # where the first item is the generated utterance.
+        if waveform.ndim == 0:
+            waveform = waveform.reshape(1, 1)
+        elif waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+        elif waveform.ndim > 2:
+            waveform = waveform.reshape(-1, waveform.shape[-1])
 
-        inputs = tokenizer(text, return_tensors="pt").to(self.device)
-        with torch.inference_mode():
-            waveform = model(**inputs).waveform
+        if waveform.shape[0] > 1:
+            waveform = waveform[:1, :]
 
-        return waveform, int(model.config.sampling_rate)
+        return waveform.contiguous()
