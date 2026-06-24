@@ -3,7 +3,7 @@ import sqlite3
 from html import escape
 from urllib.parse import quote
 from flask import Flask, request, Response, abort, render_template_string
-from twilio.twiml.voice_response import VoiceResponse, Connect, Gather
+from twilio.twiml.voice_response import VoiceResponse, Connect, Gather, Play
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
 import stats
@@ -60,6 +60,40 @@ TELNYX_VOICE_PROFILES = {
 }
 TELNYX_DEFAULT_VOICE, TELNYX_DEFAULT_LANGUAGE = TELNYX_VOICE_PROFILES["en"]
 
+# Static IVR greeting audio generated offline with Kokoro/OmniVoice.
+# These files must exist under: static/ivr/
+# Example public URLs:
+#   https://<PUBLIC_HOST>/static/ivr/ivr_greeting_en.wav
+#   https://<PUBLIC_HOST>/static/ivr/ivr_greeting_fr.wav
+#   https://<PUBLIC_HOST>/static/ivr/ivr_greeting_sw.wav
+IVR_GREETING_AUDIO_FILES = [
+    "ivr_greeting_en.wav",
+    "ivr_greeting_fr.wav",
+    "ivr_greeting_sw.wav",
+]
+
+
+def _public_base_url() -> str:
+    """Return the HTTPS public base URL for Twilio/Telnyx callbacks and static media."""
+    host = _public_host()
+    scheme = os.getenv("PUBLIC_SCHEME", "https").strip() or "https"
+    return f"{scheme}://{host}"
+
+
+def _static_ivr_url(filename: str) -> str:
+    """Return an absolute URL to a static IVR audio file."""
+    return f"{_public_base_url()}/static/ivr/{quote(filename, safe='')}"
+
+
+def _telnyx_play(filename: str) -> str:
+    """Return a Telnyx TeXML <Play> tag for a static IVR audio file."""
+    return f"<Play>{escape(_static_ivr_url(filename))}</Play>"
+
+
+def _telnyx_play_many(filenames: list[str]) -> str:
+    """Return multiple Telnyx <Play> tags, one per audio segment."""
+    return "\n        ".join(_telnyx_play(name) for name in filenames)
+
 
 def _telnyx_say(text: str, lang: str = "en") -> str:
     """Return a Telnyx <Say> tag using an explicit premium voice."""
@@ -82,7 +116,7 @@ def _media_stream_url(provider: str, lang: str) -> str:
 
 
 def _twilio_gather(prompt: str, action: str = "/twilio/language") -> Gather:
-    """Build a Twilio single-digit language Gather with a spoken prompt."""
+    """Build a Twilio single-digit Gather using TTS for non-greeting prompts."""
     gather = Gather(
         num_digits=1,
         action=action,
@@ -94,10 +128,35 @@ def _twilio_gather(prompt: str, action: str = "/twilio/language") -> Gather:
     return gather
 
 
+def _twilio_static_greeting_gather(action: str = "/twilio/language") -> Gather:
+    """Build the main IVR Gather using segmented static Kokoro/OmniVoice audio."""
+    gather = Gather(
+        num_digits=1,
+        action=action,
+        method="POST",
+        timeout=10,
+        finish_on_key="",
+    )
+
+    for filename in IVR_GREETING_AUDIO_FILES:
+        gather.append(Play(_static_ivr_url(filename)))
+
+    return gather
+
+
 def _twilio_language_menu_response(prompt: str, redirect_to: str = "/twilio/voice") -> Response:
-    """Return TwiML that repeats the language menu until a valid option is pressed."""
+    """Return TwiML that repeats the language menu until a valid option is pressed.
+
+    Only the initial IVR greeting uses static audio files. Invalid prompts stay on
+    TTS so you do not need to generate extra WAV files for every retry prompt.
+    """
     resp = VoiceResponse()
-    resp.append(_twilio_gather(prompt))
+
+    if prompt == IVR_GREETING:
+        resp.append(_twilio_static_greeting_gather())
+    else:
+        resp.append(_twilio_gather(prompt))
+
     resp.redirect(redirect_to, method="POST")
     return Response(str(resp), mimetype="text/xml")
 
@@ -114,12 +173,22 @@ def _twilio_stream_response(lang: str) -> Response:
 
 
 def _telnyx_language_menu_response(prompt: str) -> Response:
-    """Return TeXML that repeats the Telnyx language menu until a digit is received."""
+    """Return TeXML that repeats the Telnyx language menu until a digit is received.
+
+    Only the initial IVR greeting uses segmented static audio files. Invalid
+    prompts stay on Telnyx TTS.
+    """
     host = escape(_public_host())
+
+    if prompt == IVR_GREETING:
+        gather_body = _telnyx_play_many(IVR_GREETING_AUDIO_FILES)
+    else:
+        gather_body = _telnyx_say(prompt, "en")
+
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="10">
-        {_telnyx_say(prompt, "en")}
+        {gather_body}
     </Gather>
     <Redirect method="POST">https://{host}/telnyx/voice</Redirect>
 </Response>"""
