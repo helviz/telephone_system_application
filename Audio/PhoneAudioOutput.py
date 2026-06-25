@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import audioop
 import json
@@ -50,6 +51,7 @@ class PhoneAudioOutput(AudioOutput):
         self.stream_sid: str | None = None
         self.stream_id: str | None = None
         self.chunk_ms = chunk_ms
+        self._interrupted = False
 
     def set_stream_sid(self, sid: str | None):
         """Backward-compatible setter used by sockets.py after start event."""
@@ -147,7 +149,32 @@ class PhoneAudioOutput(AudioOutput):
 
         return message
 
+
+    async def clear(self):
+        """
+        Interrupt outbound assistant audio.
+
+        Twilio supports a websocket ``clear`` event, which drops provider-side
+        media that has been queued but not yet played. Telnyx RTP-style media
+        cannot recall packets already sent, but this still stops this app from
+        sending the remaining chunks.
+        """
+        self._interrupted = True
+
+        if self.provider == "twilio" and self.stream_sid:
+            clear_message = {
+                "event": "clear",
+                "streamSid": self.stream_sid,
+            }
+            try:
+                await self.ws.send_text(json.dumps(clear_message))
+                print("[PhoneAudioOutput] Sent Twilio clear event.")
+            except Exception as e:
+                print(f"[PhoneAudioOutput] Failed to send Twilio clear event: {e}")
+
     async def send_audio(self, audio: Any, sample_rate: int = 16000):
+        self._interrupted = False
+
         audio_np = self._to_float_mono(audio)
         audio_8k = self._resample_to_phone_rate(audio_np, sample_rate)
         audio_8k = self._prepare_for_phone(audio_8k)
@@ -156,15 +183,23 @@ class PhoneAudioOutput(AudioOutput):
         mulaw = audioop.lin2ulaw(pcm_8k, 2)
 
         # 20 ms is the safest packet size for PSTN-style PCMU streams.
+        # Send in real time instead of dumping the whole TTS file into the
+        # provider buffer. This makes barge-in cancellation responsive.
         chunk_size = int(self.TARGET_SAMPLE_RATE * self.MULAW_BYTES_PER_SAMPLE * self.chunk_ms / 1000)
         chunk_size = max(chunk_size, 160)
 
         for start in range(0, len(mulaw), chunk_size):
+            if self._interrupted:
+                print("[PhoneAudioOutput] Playback interrupted; dropping remaining audio chunks.")
+                return
+
             chunk = mulaw[start:start + chunk_size]
             payload = base64.b64encode(chunk).decode("utf-8")
             await self.ws.send_text(json.dumps(self._media_message(payload)))
+            await asyncio.sleep(self.chunk_ms / 1000)
 
-        await self.ws.send_text(json.dumps(self._mark_message()))
+        if not self._interrupted:
+            await self.ws.send_text(json.dumps(self._mark_message()))
 
     @classmethod
     def twilio(cls, websocket, chunk_ms: int = DEFAULT_CHUNK_MS) -> "PhoneAudioOutput":
