@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-MAX_BUFFER_CHARS = int(os.getenv("TTS_MAX_BUFFER_CHARS", "200"))
+MAX_BUFFER_CHARS = int(os.getenv("TTS_MAX_BUFFER_CHARS", "80"))
 
 SONIOX_MODEL = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1")
 SONIOX_VOICE = os.getenv("SONIOX_TTS_VOICE", "Grace")
@@ -39,7 +39,7 @@ class TTSModule:
         SONIOX_TTS_VOICE=Grace
         SONIOX_TTS_SAMPLE_RATE=24000
         SONIOX_TTS_AUDIO_FORMAT=wav
-        TTS_MAX_BUFFER_CHARS=200
+        TTS_MAX_BUFFER_CHARS=80
     """
 
     def __init__(self, output, preloaded_models: dict | None = None):
@@ -119,7 +119,7 @@ class TTSModule:
 
             buffer += chunk
 
-            if any(p in chunk for p in [".", "!", "?", "\n"]) or len(buffer) >= MAX_BUFFER_CHARS:
+            if any(p in chunk for p in [".", "!", "?", "\n", ",", ";", ":"]) or len(buffer) >= MAX_BUFFER_CHARS:
                 to_say, buffer = self._pop_speakable_text(buffer)
                 if to_say:
                     cb = None
