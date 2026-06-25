@@ -105,7 +105,7 @@ def _twilio_audio_gather(audio_filename: str, action: str = "/twilio/language") 
         num_digits=1,
         action=action,
         method="POST",
-        timeout=10,
+        timeout=int(os.getenv("IVR_GATHER_TIMEOUT", "3")),
         finish_on_key="",
     )
     gather.append(Play(_static_ivr_url(audio_filename)))
@@ -137,7 +137,7 @@ def _telnyx_language_menu_response(audio_filename: str = IVR_GREETING_AUDIO_FILE
 
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="10">
+    <Gather numDigits="1" action="https://{host}/telnyx/language" method="POST" timeout="{escape(os.getenv('IVR_GATHER_TIMEOUT', '3'))}">
         {gather_body}
     </Gather>
     <Redirect method="POST">https://{host}/telnyx/voice</Redirect>
