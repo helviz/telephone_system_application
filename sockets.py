@@ -4,6 +4,7 @@ import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from urllib.parse import unquote
 
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -163,8 +164,9 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
 
     await websocket.accept()
 
-    # Caller identity query param parsed
+    # Caller identity and initial post-IVR greeting are passed from routes.py.
     caller_number = websocket.query_params.get("From", "UNKNOWN")
+    initial_greeting = unquote(websocket.query_params.get("InitialGreeting", "") or "").strip()
     session_id = f"{provider}:{id(websocket)}"
 
     # COMPATIBILITY FIX: Write to memory Dashboard AND persist session entry to SQLite
@@ -214,8 +216,43 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
         except Exception as e:
             print(f"\n[{provider.upper()}] Receiver error: {e}")
 
+    async def wait_for_outbound_stream_ready(timeout_s: float = 3.0):
+        """
+        Give the provider's first websocket/start event a moment to arrive before
+        sending the TTS greeting. Twilio needs streamSid on outbound media;
+        Telnyx is less strict, but waiting is still harmless.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if output.stream_sid or output.stream_id:
+                return True
+            if getattr(source, "stream_sid", None):
+                output.set_stream_sid(source.stream_sid)
+                return True
+            if getattr(source, "stream_id", None):
+                output.set_stream_id(source.stream_id)
+                return True
+            await asyncio.sleep(0.02)
+
+        print(
+            f"[{provider.upper()}] Outbound stream id not observed after {timeout_s:.1f}s; "
+            "attempting greeting anyway."
+        )
+        return False
+
+    async def assistant_runner():
+        await wait_for_outbound_stream_ready()
+
+        if initial_greeting:
+            print(f"[{provider.upper()}] Speaking initial greeting through TTS: {initial_greeting!r}")
+            await assistant.speak_greeting(initial_greeting)
+        else:
+            print(f"[{provider.upper()}] No InitialGreeting query parameter received.")
+
+        await assistant.start()
+
     receiver_task = asyncio.create_task(websocket_receiver())
-    assistant_task = asyncio.create_task(assistant.start())
+    assistant_task = asyncio.create_task(assistant_runner())
 
     try:
         done, pending = await asyncio.wait(
