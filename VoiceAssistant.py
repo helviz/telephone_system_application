@@ -112,6 +112,40 @@ class VoiceAssistant:
         except Exception as e:
             print(f"[VoiceAssistant] Pipeline error: {e}")
 
+    async def speak_greeting(self, text: str):
+        """
+        Speak the post-IVR greeting through the configured TTS module.
+
+        This bypasses the LLM and is used immediately after the caller selects
+        a language from the static IVR WAV menu.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+
+        print(f"[Assistant Greeting]: {text}")
+
+        async def _one_chunk():
+            yield text
+
+        try:
+            await self.tts.speak_stream(
+                _one_chunk(),
+                lang=self.lang,
+                on_first_audio=None,
+            )
+
+            if self.on_turn_logged:
+                try:
+                    await self.on_turn_logged(role="assistant", text=text)
+                except Exception as log_err:
+                    print(f"[VoiceAssistant] Error logging greeting turn to DB: {log_err}")
+
+        except asyncio.CancelledError:
+            print("[VoiceAssistant] Greeting playback cancelled.")
+            raise
+        except Exception as e:
+            print(f"[VoiceAssistant] Greeting TTS error: {e}")
 
     async def _clear_audio_output(self):
         """Stop queued/playing assistant audio when the caller barges in."""
