@@ -105,13 +105,14 @@ class TTSModule:
 
     async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
         """
-        Consume the LLM's async text stream, split it into speakable chunks,
-        generate Soniox audio for each chunk, and send it to PhoneAudioOutput.
+        Consume the LLM's async text stream, split it into natural sentence-sized
+        chunks, generate Soniox audio, and send it to PhoneAudioOutput.
         """
         self._language_for(lang)
 
         buffer = ""
         first_audio_fired = False
+        sentence_endings = {".", "!", "?", "\n"}
 
         async for chunk in text_generator:
             if not chunk:
@@ -119,13 +120,19 @@ class TTSModule:
 
             buffer += chunk
 
-            if any(p in chunk for p in [".", "!", "?", "\n", ",", ";", ":"]) or len(buffer) >= MAX_BUFFER_CHARS:
+            should_speak = (
+                    any(p in chunk for p in sentence_endings)
+                    or len(buffer) >= MAX_BUFFER_CHARS
+            )
+
+            if should_speak:
                 to_say, buffer = self._pop_speakable_text(buffer)
                 if to_say:
                     cb = None
                     if not first_audio_fired and on_first_audio:
                         cb = on_first_audio
                         first_audio_fired = True
+
                     await self._generate_audio(to_say, lang, on_first_audio=cb)
 
         if buffer.strip():
@@ -133,6 +140,7 @@ class TTSModule:
             if not first_audio_fired and on_first_audio:
                 cb = on_first_audio
                 first_audio_fired = True
+
             await self._generate_audio(buffer.strip(), lang, on_first_audio=cb)
 
     @staticmethod
@@ -245,7 +253,7 @@ class TTSModule:
 
         fade_in_samples = min(int(sample_rate * 0.005), n)
         fade_out_samples = min(int(sample_rate * 0.010), n)
-        silence_samples = int(sample_rate * 0.030)
+        silence_samples = int(sample_rate * 0.005)
 
         if fade_in_samples > 1:
             fade_in = torch.linspace(0.0, 1.0, fade_in_samples)
