@@ -300,8 +300,48 @@ class TTSModule:
         else:
             audio = _run_generate()
 
+        sample_rate = int(bundle.get("sample_rate", OMNIVOICE_SAMPLE_RATE))
         waveform = self._to_mono_tensor(audio)
-        return waveform, int(bundle.get("sample_rate", OMNIVOICE_SAMPLE_RATE))
+        waveform = self._apply_omnivoice_envelope(waveform, sample_rate)
+        return waveform, sample_rate
+
+    @staticmethod
+    def _apply_omnivoice_envelope(waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
+        """
+        Eliminate the crackling/clicking artifacts that OmniVoice produces at
+        segment boundaries.
+
+        OmniVoice's diffusion decoder does not taper the waveform to zero at
+        the start or end of each chunk, so abrupt joins between segments (or
+        between a segment and silence) create audible clicks.  Three cheap
+        fixes applied in sequence solve this:
+
+          1. 5 ms linear fade-in  — removes click at the leading edge.
+          2. 10 ms linear fade-out — removes click/pop at the trailing edge,
+             where the artefact is most common.
+          3. 50 ms silence pad    — gives the phone codec a clean tail instead
+             of an abrupt cut, and gives the listener a natural pause between
+             sentences.
+        """
+        n = waveform.shape[-1]
+
+        fade_in_samples  = int(sample_rate * 0.005)   # 5 ms
+        fade_out_samples = int(sample_rate * 0.010)   # 10 ms
+        silence_samples  = int(sample_rate * 0.050)   # 50 ms
+
+        if n > fade_in_samples:
+            fade_in = torch.linspace(0.0, 1.0, fade_in_samples, device=waveform.device)
+            waveform[..., :fade_in_samples] *= fade_in
+
+        if n > fade_out_samples:
+            fade_out = torch.linspace(1.0, 0.0, fade_out_samples, device=waveform.device)
+            waveform[..., -fade_out_samples:] *= fade_out
+
+        silence = torch.zeros(waveform.shape[0], silence_samples,
+                              dtype=waveform.dtype, device=waveform.device)
+        waveform = torch.cat([waveform, silence], dim=-1)
+
+        return waveform
 
     @staticmethod
     def _concat_or_silence(chunks: list[torch.Tensor]) -> torch.Tensor:
