@@ -30,6 +30,7 @@ class VoiceAssistant:
             model_size=None,
             lang=self.lang,
             preloaded_model=preloaded_whisper,
+            on_speech_start=self._on_caller_speech_start,
         )
 
         self.llm = LLM.get_model(provider=provider, lang=self.lang)
@@ -110,6 +111,27 @@ class VoiceAssistant:
 
         except Exception as e:
             print(f"[VoiceAssistant] Pipeline error: {e}")
+
+
+    async def _clear_audio_output(self):
+        """Stop queued/playing assistant audio when the caller barges in."""
+        for method_name in ("clear", "clear_buffer", "interrupt", "stop_playback"):
+            method = getattr(self.audio_output, method_name, None)
+            if callable(method):
+                result = method()
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+
+    async def _on_caller_speech_start(self):
+        """
+        Called by STT immediately when WebRTC VAD detects new caller speech.
+        This stops TTS before waiting for Whisper to finish transcription.
+        """
+        if self._active_task and not self._active_task.done():
+            print("[VoiceAssistant] 🎙️ Caller barge-in — stopping assistant audio now.")
+            await self._clear_audio_output()
+            await self._cancel_active()
 
     async def _cancel_active(self):
         """Cancel the in-flight LLM→TTS task and wait for it to finish."""
