@@ -51,26 +51,16 @@ IVR_INVALID = (
     "Press 1 for English, 2 for French, or 3 for Swahili."
 )
 
-# Telnyx TeXML voice settings. Telnyx defaults can sound poor, so explicitly
-# request clearer Polly voices for the IVR and short transition prompts.
-TELNYX_VOICE_PROFILES = {
-    "en": ("Polly.Joanna-Neural", "en-US"),
-    "fr": ("Polly.Celine-Neural", "fr-FR"),
-    "sw": ("Polly.Joanna-Neural", "en-US"),  # fallback for menu/transition prompt
-}
-TELNYX_DEFAULT_VOICE, TELNYX_DEFAULT_LANGUAGE = TELNYX_VOICE_PROFILES["en"]
-
-# Static IVR greeting audio generated offline. Runtime conversation TTS uses Soniox.
+# Static IVR audio generated offline with Soniox Grace voice.
 # These files must exist under: static/ivr/
-# Example public URLs:
-#   https://<PUBLIC_HOST>/static/ivr/ivr_greeting_en.wav
-#   https://<PUBLIC_HOST>/static/ivr/ivr_greeting_fr.wav
-#   https://<PUBLIC_HOST>/static/ivr/ivr_greeting_sw.wav
-IVR_GREETING_AUDIO_FILES = [
-    "ivr_greeting_en.wav",
-    "ivr_greeting_fr.wav",
-    "ivr_greeting_sw.wav",
-]
+#   static/ivr/ivr.wav
+#   static/ivr/ivr_invalid.wav
+#
+# Only the IVR menu uses static files. After a valid digit is selected,
+# routes.py connects directly to the WebSocket. The app pipeline should then
+# speak HELP_GREETINGS[lang] through TTSModule + PhoneAudioOutput, not provider TTS.
+IVR_GREETING_AUDIO_FILE = "ivr.wav"
+IVR_INVALID_AUDIO_FILE = "ivr_invalid.wav"
 
 
 def _public_base_url() -> str:
@@ -90,100 +80,60 @@ def _telnyx_play(filename: str) -> str:
     return f"<Play>{escape(_static_ivr_url(filename))}</Play>"
 
 
-def _telnyx_play_many(filenames: list[str]) -> str:
-    """Return multiple Telnyx <Play> tags, one per audio segment."""
-    return "\n        ".join(_telnyx_play(name) for name in filenames)
-
-
-def _telnyx_say(text: str, lang: str = "en") -> str:
-    """Return a Telnyx <Say> tag using an explicit premium voice."""
-    voice, language = TELNYX_VOICE_PROFILES.get(lang, TELNYX_VOICE_PROFILES["en"])
-    return (
-        f'<Say voice="{escape(voice)}" language="{escape(language)}">'
-        f'{escape(text)}'
-        f'</Say>'
-    )
-
-
 def _caller_param_from_request() -> str:
     """Return a URL-safe caller value for media-stream query parameters."""
     return quote(request.form.get("From", "UNKNOWN"), safe="")
 
 
 def _media_stream_url(provider: str, lang: str) -> str:
-    """Build the websocket URL used by Twilio and Telnyx media streams."""
-    return f"wss://{_public_host()}/media-stream/{provider}/{lang}?From={_caller_param_from_request()}"
+    """Build the WebSocket URL used by Twilio and Telnyx media streams.
 
-
-def _twilio_gather(prompt: str, action: str = "/twilio/language") -> Gather:
-    """Build a Twilio single-digit Gather using TTS for non-greeting prompts."""
-    gather = Gather(
-        num_digits=1,
-        action=action,
-        method="POST",
-        timeout=10,
-        finish_on_key="",
-    )
-    gather.say(prompt, voice="Polly.Joanna-Neural")
-    return gather
-
-
-def _twilio_static_greeting_gather(action: str = "/twilio/language") -> Gather:
-    """Build the main IVR Gather using segmented static IVR audio."""
-    gather = Gather(
-        num_digits=1,
-        action=action,
-        method="POST",
-        timeout=10,
-        finish_on_key="",
-    )
-
-    for filename in IVR_GREETING_AUDIO_FILES:
-        gather.append(Play(_static_ivr_url(filename)))
-
-    return gather
-
-
-def _twilio_language_menu_response(prompt: str, redirect_to: str = "/twilio/voice") -> Response:
-    """Return TwiML that repeats the language menu until a valid option is pressed.
-
-    Only the initial IVR greeting uses static audio files. Invalid prompts stay on
-    TTS so you do not need to generate extra WAV files for every retry prompt.
+    The InitialGreeting is passed to the WebSocket so sockets.py/VoiceAssistant
+    can speak it through TTSModule. Do not use Twilio/Telnyx <Say> after IVR.
     """
+    from_param = _caller_param_from_request()
+    greeting_param = quote(HELP_GREETINGS.get(lang, HELP_GREETINGS["en"]), safe="")
+    return (
+        f"wss://{_public_host()}/media-stream/{provider}/{lang}"
+        f"?From={from_param}&InitialGreeting={greeting_param}"
+    )
+
+
+def _twilio_audio_gather(audio_filename: str, action: str = "/twilio/language") -> Gather:
+    """Play a static WAV inside <Gather> so Twilio still collects 1/2/3."""
+    gather = Gather(
+        num_digits=1,
+        action=action,
+        method="POST",
+        timeout=10,
+        finish_on_key="",
+    )
+    gather.append(Play(_static_ivr_url(audio_filename)))
+    return gather
+
+
+def _twilio_language_menu_response(audio_filename: str = IVR_GREETING_AUDIO_FILE,
+                                   redirect_to: str = "/twilio/voice") -> Response:
+    """Return TwiML that plays a static IVR WAV and collects a digit."""
     resp = VoiceResponse()
-
-    if prompt == IVR_GREETING:
-        resp.append(_twilio_static_greeting_gather())
-    else:
-        resp.append(_twilio_gather(prompt))
-
+    resp.append(_twilio_audio_gather(audio_filename))
     resp.redirect(redirect_to, method="POST")
     return Response(str(resp), mimetype="text/xml")
 
 
 def _twilio_stream_response(lang: str) -> Response:
-    """Confirm language selection, then connect the call to the Twilio stream."""
+    """Connect the call to the Twilio stream immediately after IVR selection."""
     resp = VoiceResponse()
-    resp.say(LANGUAGE_SELECTED_PROMPTS[lang], voice="Polly.Joanna-Neural")
-
     connect = Connect()
     connect.stream(url=_media_stream_url("twilio", lang))
     resp.append(connect)
     return Response(str(resp), mimetype="text/xml")
 
 
-def _telnyx_language_menu_response(prompt: str) -> Response:
-    """Return TeXML that repeats the Telnyx language menu until a digit is received.
-
-    Only the initial IVR greeting uses segmented static audio files. Invalid
-    prompts stay on Telnyx TTS.
-    """
+def _telnyx_language_menu_response(audio_filename: str = IVR_GREETING_AUDIO_FILE) -> Response:
+    """Return TeXML that plays a static IVR WAV and collects a digit."""
     host = escape(_public_host())
-
-    if prompt == IVR_GREETING:
-        gather_body = _telnyx_play_many(IVR_GREETING_AUDIO_FILES)
-    else:
-        gather_body = _telnyx_say(prompt, "en")
+    gather_body = _telnyx_play(audio_filename)
 
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -196,16 +146,12 @@ def _telnyx_language_menu_response(prompt: str) -> Response:
 
 
 def _telnyx_stream_response(lang: str) -> Response:
-    """Confirm language selection, then open Telnyx WebSocket stream."""
+    """Connect the call to the Telnyx stream immediately after IVR selection."""
     host = escape(_public_host())
-    caller = quote(request.form.get("From", "UNKNOWN"), safe="")
-    greeting_say = _telnyx_say(HELP_GREETINGS[lang], lang)
-
-    stream_url = f"wss://{host}/media-stream/telnyx/{escape(lang)}?From={caller}"
+    stream_url = escape(_media_stream_url("telnyx", lang))
 
     texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    {greeting_say}
     <Connect>
         <Stream
             url="{stream_url}"
@@ -611,7 +557,7 @@ def metrics():
 @app.route("/twilio/voice", methods=["POST"])
 def twilio_voice():
     _validate_twilio()
-    return _twilio_language_menu_response(IVR_GREETING)
+    return _twilio_language_menu_response(IVR_GREETING_AUDIO_FILE)
 
 
 @app.route("/twilio/language", methods=["POST"])
@@ -620,7 +566,7 @@ def twilio_language():
 
     digit = request.form.get("Digits", "")
     if digit not in LANG_MAP:
-        return _twilio_language_menu_response(IVR_INVALID)
+        return _twilio_language_menu_response(IVR_INVALID_AUDIO_FILE)
 
     lang, lang_name = LANG_MAP[digit]
     print(f"[Twilio IVR] Caller selected: {lang_name} ({lang})")
@@ -633,14 +579,14 @@ def twilio_language():
 
 @app.route("/telnyx/voice", methods=["POST"])
 def telnyx_voice():
-    return _telnyx_language_menu_response(IVR_GREETING)
+    return _telnyx_language_menu_response(IVR_GREETING_AUDIO_FILE)
 
 
 @app.route("/telnyx/language", methods=["POST"])
 def telnyx_language():
     digit = request.form.get("Digits", "")
     if digit not in LANG_MAP:
-        return _telnyx_language_menu_response(IVR_INVALID)
+        return _telnyx_language_menu_response(IVR_INVALID_AUDIO_FILE)
 
     lang, lang_name = LANG_MAP[digit]
     print(f"[Telnyx IVR] Caller selected: {lang_name} ({lang})")
