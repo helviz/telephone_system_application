@@ -7,18 +7,6 @@ from tts.TTSModule import TTSModule
 
 
 class VoiceAssistant:
-    """
-    FIX 4: The original start() spawned a new asyncio.Task for every
-    transcribed utterance without cancelling the previous one. If the caller
-    spoke again while the assistant was still generating audio, two (or more)
-    LLM→TTS pipelines ran concurrently, producing overlapping audio and
-    wasting compute.
-
-    Fix: keep a reference to the single active handle_text task. When a new
-    utterance arrives, cancel the in-flight task first (barge-in behaviour),
-    then start a fresh one. CancelledError is suppressed inside handle_text
-    so the cancellation is clean.
-    """
 
     def __init__(
             self,
@@ -48,8 +36,8 @@ class VoiceAssistant:
 
         self.audio_output = output
 
-        # Pass the preloaded_tts dict safely. TTSModule handles the lazy-loading fallback
-        # seamlessly if this dictionary comes in empty from sockets.py.
+        # Pass Soniox TTS configuration from sockets.py. Soniox is API-backed,
+        # so this dict contains config only, not local Kokoro/OmniVoice weights.
         self.tts = TTSModule(
             output=self.audio_output,
             preloaded_models=preloaded_tts

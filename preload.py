@@ -1,47 +1,28 @@
 import os
-import random
 import sys
 import time
 
-import numpy as np
-
 """
-Loads all model families into memory so the first caller never waits:
+Preload / validate runtime dependencies before the server starts.
 
     STT  — Faster-Whisper, shared by all languages
-    TTS  — Kokoro en=af_heart, fr=ff_siwis; OmniVoice for Swahili
+    TTS  — Soniox API using the configured voice; no local TTS weights loaded
     LLM  — GGUF via llama.cpp singleton, when local provider is enabled
+
+Soniox TTS is API-backed, so this file intentionally does NOT import/load
+Kokoro, OmniVoice, torch TTS models, or voice-design seeds.
 """
 
 print("\n" + "=" * 60)
-print("🔥 PRELOADING ALL MODELS — server will start after this")
+print("🔥 PRELOADING CORE MODELS — server will start after this")
 print("=" * 60 + "\n")
 
 total_start = time.time()
 
-def seed_omnivoice(seed: int | None = None) -> int:
-    """Seed RNGs before loading/generating with OmniVoice."""
-    import torch
 
-    seed = int(seed if seed is not None else os.getenv("OMNIVOICE_SEED", "12345"))
-    random.seed(seed)
-    np.random.seed(seed % (2**32 - 1))
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    try:
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-    except Exception:
-        pass
-
-    return seed
-
-
+# ---------------------------------------------------------------------------
 # STT — Faster-Whisper
+# ---------------------------------------------------------------------------
 print("📦 [1/3] Loading Faster-Whisper ...")
 t = time.time()
 try:
@@ -63,66 +44,56 @@ except Exception as e:
     sys.exit(1)
 
 
-# TTS — Kokoro for en/fr, OmniVoice for sw
-print("📦 [2/3] Loading TTS: Kokoro(en=af_heart, fr=ff_siwis) + OmniVoice(sw) ...")
+# ---------------------------------------------------------------------------
+# TTS — Soniox API configuration only
+# ---------------------------------------------------------------------------
+print("📦 [2/3] Configuring TTS: Soniox API ...")
 t = time.time()
 try:
-    import torch
-    from kokoro import KPipeline
-    from omnivoice import OmniVoice
+    from soniox import SonioxClient  # noqa: F401
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
-    device_map = "cuda:0" if device == "cuda" else "cpu"
-    omnivoice_seed = seed_omnivoice()
-    print(f"   🎚️  OmniVoice deterministic seed: {omnivoice_seed}")
+    if not os.getenv("SONIOX_API_KEY"):
+        raise RuntimeError("SONIOX_API_KEY is not set in environment/secrets.")
 
-    _tts_store = {}
-
-    kokoro_slots = {
-        "en": {"voice": "af_heart", "lang_code": "a"},
-        "fr": {"voice": "ff_siwis", "lang_code": "f"},
+    _tts_store = {
+        "en": {
+            "engine": "soniox",
+            "model": os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1"),
+            "voice": os.getenv("SONIOX_TTS_VOICE", "Grace"),
+            "language": os.getenv("SONIOX_TTS_LANG_EN", "en"),
+            "audio_format": os.getenv("SONIOX_TTS_AUDIO_FORMAT", "wav"),
+            "sample_rate": int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "24000")),
+        },
+        "fr": {
+            "engine": "soniox",
+            "model": os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1"),
+            "voice": os.getenv("SONIOX_TTS_VOICE", "Grace"),
+            "language": os.getenv("SONIOX_TTS_LANG_FR", "fr"),
+            "audio_format": os.getenv("SONIOX_TTS_AUDIO_FORMAT", "wav"),
+            "sample_rate": int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "24000")),
+        },
+        "sw": {
+            "engine": "soniox",
+            "model": os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1"),
+            "voice": os.getenv("SONIOX_TTS_VOICE", "Grace"),
+            "language": os.getenv("SONIOX_TTS_LANG_SW", "sw"),
+            "audio_format": os.getenv("SONIOX_TTS_AUDIO_FORMAT", "wav"),
+            "sample_rate": int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "24000")),
+        },
     }
-
-    for lang, cfg in kokoro_slots.items():
-        lt = time.time()
-        print(f"   Loading {lang} → Kokoro voice {cfg['voice']} ...")
-        _tts_store[lang] = {
-            "engine": "kokoro",
-            "pipeline": KPipeline(lang_code=cfg["lang_code"]),
-            "voice": cfg["voice"],
-            "sample_rate": 24000,
-        }
-        print(f"   ✅ {lang} Kokoro ready — {time.time() - lt:.1f}s")
-
-    lt = time.time()
-    sw_model_name = "k2-fsa/OmniVoice"
-    print(f"   Loading sw → {sw_model_name} ...")
-    seed_omnivoice(omnivoice_seed)
-    sw_model = OmniVoice.from_pretrained(
-        sw_model_name,
-        device_map=device_map,
-        dtype=dtype,
+    print(
+        "   ✅ Soniox TTS configured "
+        f"voice=[{_tts_store['en']['voice']}] model=[{_tts_store['en']['model']}] — {time.time() - t:.1f}s\n"
     )
-    _tts_store["sw"] = {
-        "engine": "omnivoice",
-        "model": sw_model,
-        "sample_rate": 24000,
-        "instruct": "female, middle-aged, moderate pitch",
-        "num_step": 16,
-        "speed": 1.0,
-        "language_id": "sw",
-        "seed": omnivoice_seed,
-    }
-    print(f"   ✅ sw OmniVoice ready — {time.time() - lt:.1f}s")
-
-    print(f"   ✅ All TTS engines loaded on [{device}] — {time.time() - t:.1f}s\n")
 except Exception as e:
-    print(f"   ❌ TTS failed to load: {e}")
+    print(f"   ❌ Soniox TTS configuration failed: {e}")
+    print("   Add `soniox` to requirements.txt and set SONIOX_API_KEY in secrets/env vars.")
     sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
 # LLM — GGUF singleton
+# ---------------------------------------------------------------------------
 llm_provider = os.getenv("LLM_PROVIDER", "gguf").strip().lower()
 
 if llm_provider in ("qwen", "gguf", "local"):
@@ -136,5 +107,7 @@ if llm_provider in ("qwen", "gguf", "local"):
     except Exception as e:
         print(f"   ❌ GGUF LLM failed to preload: {e}")
         sys.exit(1)
+else:
+    print("📦 [3/3] Using cloud LLM provider. Skipping local GGUF preload.\n")
 
 print(f"🎉 Preload pipeline successful. Total setup execution window: {time.time() - total_start:.1f}s\n")

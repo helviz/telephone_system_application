@@ -1,12 +1,10 @@
 import os
-import random
 import sys
 import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.wsgi import WSGIMiddleware
@@ -24,28 +22,9 @@ load_dotenv()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gguf").strip().lower()
 
 
-def seed_omnivoice(seed: int | None = None) -> int:
-    """Seed RNGs before loading/generating with OmniVoice."""
-    seed = int(seed if seed is not None else os.getenv("OMNIVOICE_SEED", "12345"))
-    random.seed(seed)
-    np.random.seed(seed % (2**32 - 1))
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    try:
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-    except Exception:
-        pass
-
-    return seed
-
 
 # ---------------------------------------------------------------------------
-# In-process model store — populated by lifespan, read by WebSocket handler
+# In-process runtime store — populated by lifespan, read by WebSocket handler
 # ---------------------------------------------------------------------------
 _preloaded_tts: dict = {}
 _preloaded_whisper = None
@@ -80,73 +59,57 @@ def _load_models():
     print(f"   ✅ Faster-Whisper loaded on {resolved_device} in {time.time() - t:.1f}s\n")
 
     # ------------------------------------------------------------------
-    # TTS — Kokoro for English/French, OmniVoice for Swahili
+    # TTS — Soniox API configuration only
     # ------------------------------------------------------------------
-    print("📦 [2/3] Loading TTS: Kokoro(en=af_heart, fr=ff_siwis) + OmniVoice(sw)...")
+    print("📦 [2/3] Configuring TTS: Soniox API...")
     t = time.time()
 
     try:
-        from kokoro import KPipeline
-    except Exception as exc:
+        from soniox import SonioxClient  # noqa: F401
+
+        if not os.getenv("SONIOX_API_KEY"):
+            raise RuntimeError("SONIOX_API_KEY is not set in environment/secrets.")
+
+        soniox_model = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1")
+        soniox_voice = os.getenv("SONIOX_TTS_VOICE", "Grace")
+        soniox_format = os.getenv("SONIOX_TTS_AUDIO_FORMAT", "wav")
+        soniox_sample_rate = int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "24000"))
+
+        _preloaded_tts.clear()
+        _preloaded_tts.update({
+            "en": {
+                "engine": "soniox",
+                "model": soniox_model,
+                "voice": soniox_voice,
+                "language": os.getenv("SONIOX_TTS_LANG_EN", "en"),
+                "audio_format": soniox_format,
+                "sample_rate": soniox_sample_rate,
+            },
+            "fr": {
+                "engine": "soniox",
+                "model": soniox_model,
+                "voice": soniox_voice,
+                "language": os.getenv("SONIOX_TTS_LANG_FR", "fr"),
+                "audio_format": soniox_format,
+                "sample_rate": soniox_sample_rate,
+            },
+            "sw": {
+                "engine": "soniox",
+                "model": soniox_model,
+                "voice": soniox_voice,
+                "language": os.getenv("SONIOX_TTS_LANG_SW", "sw"),
+                "audio_format": soniox_format,
+                "sample_rate": soniox_sample_rate,
+            },
+        })
         print(
-            "   ❌ Kokoro failed to import. Add `kokoro==0.9.4` to requirements.txt "
-            "and rebuild/redeploy the app."
+            "   ✅ Soniox TTS configured "
+            f"voice=[{soniox_voice}] model=[{soniox_model}] — {time.time() - t:.1f}s\n"
         )
-        raise exc
-
-    try:
-        from omnivoice import OmniVoice
     except Exception as exc:
-        print(
-            "   ❌ OmniVoice failed to import. Add `omnivoice` to requirements.txt "
-            "and rebuild/redeploy the app."
-        )
-        raise exc
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
-    device_map = "cuda:0" if device == "cuda" else "cpu"
-    omnivoice_seed = seed_omnivoice()
-    print(f"   🎚️  OmniVoice deterministic seed: {omnivoice_seed}")
-
-    kokoro_slots = {
-        "en": {"voice": "af_heart", "lang_code": "a"},
-        "fr": {"voice": "ff_siwis", "lang_code": "f"},
-    }
-
-    for lang, cfg in kokoro_slots.items():
-        lt = time.time()
-        print(f"   Loading language slot [{lang}] via Kokoro voice {cfg['voice']}...")
-        _preloaded_tts[lang] = {
-            "engine": "kokoro",
-            "pipeline": KPipeline(lang_code=cfg["lang_code"]),
-            "voice": cfg["voice"],
-            "sample_rate": 24000,
-        }
-        print(f"   ✅ Language component [{lang}] Kokoro ready — {time.time() - lt:.1f}s")
-
-    lt = time.time()
-    sw_model_name = "k2-fsa/OmniVoice"
-    print(f"   Loading language slot [sw] via {sw_model_name}...")
-    seed_omnivoice(omnivoice_seed)
-    sw_model = OmniVoice.from_pretrained(
-        sw_model_name,
-        device_map=device_map,
-        dtype=dtype,
-    )
-    _preloaded_tts["sw"] = {
-        "engine": "omnivoice",
-        "model": sw_model,
-        "sample_rate": 24000,
-        "instruct": "female, middle-aged, moderate pitch",
-        "num_step": 16,
-        "speed": 1.0,
-        "language_id": "sw",
-        "seed": omnivoice_seed,
-    }
-    print(f"   ✅ Language component [sw] OmniVoice ready — {time.time() - lt:.1f}s")
-
-    print(f"   ✅ All TTS configurations allocated on {device} — {time.time() - t:.1f}s\n")
+        print(f"   ❌ Soniox TTS configuration failed: {exc}")
+        print("   Add `soniox` to requirements.txt and set SONIOX_API_KEY in secrets/env vars.")
+        raise
 
     # ------------------------------------------------------------------
     # LLM — GGUF Warm Up Engine Singleton

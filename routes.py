@@ -60,7 +60,7 @@ TELNYX_VOICE_PROFILES = {
 }
 TELNYX_DEFAULT_VOICE, TELNYX_DEFAULT_LANGUAGE = TELNYX_VOICE_PROFILES["en"]
 
-# Static IVR greeting audio generated offline with Kokoro/OmniVoice.
+# Static IVR greeting audio generated offline. Runtime conversation TTS uses Soniox.
 # These files must exist under: static/ivr/
 # Example public URLs:
 #   https://<PUBLIC_HOST>/static/ivr/ivr_greeting_en.wav
@@ -129,7 +129,7 @@ def _twilio_gather(prompt: str, action: str = "/twilio/language") -> Gather:
 
 
 def _twilio_static_greeting_gather(action: str = "/twilio/language") -> Gather:
-    """Build the main IVR Gather using segmented static Kokoro/OmniVoice audio."""
+    """Build the main IVR Gather using segmented static IVR audio."""
     gather = Gather(
         num_digits=1,
         action=action,
