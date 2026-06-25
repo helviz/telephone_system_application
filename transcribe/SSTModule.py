@@ -56,26 +56,26 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 # Defaults tuned for low-latency narrowband phone speech after upsampling to 16 kHz.
 # These can still be overridden from Hugging Face / Docker env variables.
-VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 2, 0, 3)
+VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 1, 0, 3)
 
 # Two-stage turn finalization for phone calls:
 #   1. END_SILENCE_MS marks a possible end-of-speech.
 #   2. FINAL_GRACE_MS waits a little longer before yielding text to the LLM.
 # If the caller resumes during the grace window, the pending flush is cancelled
 # and the new audio is merged into the same utterance.
-END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 650, 200, 3000)
+END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 500, 200, 3000)
 END_SILENCE_FRAMES = max(1, END_SILENCE_MS // FRAME_MS)
 
-FINAL_GRACE_MS = _env_int("STT_FINAL_GRACE_MS", 250, 0, 3000)
+FINAL_GRACE_MS = _env_int("STT_FINAL_GRACE_MS", 1000, 0, 3000)
 FINAL_GRACE_FRAMES = max(0, FINAL_GRACE_MS // FRAME_MS)
 
-PADDING_MS = _env_int("STT_PADDING_MS", 300, 0, 2000)
+PADDING_MS = _env_int("STT_PADDING_MS", 250, 0, 2000)
 PADDING_FRAMES = max(1, PADDING_MS // FRAME_MS)
 
 MAX_UTTERANCE_MS = _env_int("STT_MAX_UTTERANCE_MS", 20_000, 1000, 120_000)
 MAX_UTTERANCE_FRAMES = max(1, MAX_UTTERANCE_MS // FRAME_MS)
 
-MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 8000, 1600, 160000)
+MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 6400, 1600, 160000)
 MIN_RMS = _env_float("STT_MIN_RMS", 0.006, 0.0, 1.0)
 
 # Extra protection against Whisper hallucinating common phrases on silence/noise.
@@ -96,12 +96,14 @@ BAD_SILENCE_PHRASES = {
 
 
 class STTModule:
-    def __init__(self, model_size=None, device=None, lang="en", preloaded_model=None):
+    def __init__(self, model_size=None, device=None, lang="en", preloaded_model=None, on_speech_start=None):
         allowed_languages = ["en", "fr", "sw"]
         if lang not in allowed_languages:
             raise ValueError(f"Language '{lang}' not supported. Choose from {allowed_languages}")
 
         self.lang = lang
+        self.on_speech_start = on_speech_start
+        self._last_speech_start_notify = 0.0
 
         if preloaded_model is not None:
             self.model = preloaded_model
@@ -122,6 +124,25 @@ class STTModule:
             compute_type=compute_type,
             download_root=os.getenv("HF_HOME"),
         )
+
+
+    async def _notify_speech_start(self):
+        """Notify the assistant immediately when caller speech starts."""
+        if not self.on_speech_start:
+            return
+
+        now = time.time()
+        if now - self._last_speech_start_notify < 0.5:
+            return
+
+        self._last_speech_start_notify = now
+
+        try:
+            result = self.on_speech_start()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            print(f"[STT] Speech-start callback failed: {e}")
 
     @staticmethod
     def _rms(audio_data: np.ndarray) -> float:
@@ -290,6 +311,7 @@ class STTModule:
                             grace_resets = 0
                             t_speech_start = time.time()
                             print(f"[STT][{t_speech_start:.3f}] Speech start detected.")
+                            await self._notify_speech_start()
 
                             # Include a small amount of pre-speech padding so Whisper
                             # does not lose the beginning of the caller's first word.
