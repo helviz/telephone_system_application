@@ -19,8 +19,8 @@ RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-RUN pip install --no-cache-dir llama-cpp-python==0.3.22 \
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu128
+RUN pip install --no-cache-dir --prefer-binary llama-cpp-python==0.3.22 \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
