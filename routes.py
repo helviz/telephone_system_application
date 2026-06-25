@@ -92,7 +92,8 @@ def _media_stream_url(provider: str, lang: str) -> str:
     can speak it through TTSModule. Do not use Twilio/Telnyx <Say> after IVR.
     """
     from_param = _caller_param_from_request()
-    greeting_param = quote(HELP_GREETINGS.get(lang, HELP_GREETINGS["en"]), safe="")
+    greeting_text = LANGUAGE_SELECTED_PROMPTS.get(lang, LANGUAGE_SELECTED_PROMPTS["en"])
+    greeting_param = quote(greeting_text, safe="")
     return (
         f"wss://{_public_host()}/media-stream/{provider}/{lang}"
         f"?From={from_param}&InitialGreeting={greeting_param}"
