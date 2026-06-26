@@ -1,8 +1,9 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
 echo "🚀 Starting Voice Assistant..."
-export PORT=7860
+export PORT="${PORT:-7860}"
 
-python3 sockets.py
+
+exec python3 sockets.py
