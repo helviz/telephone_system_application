@@ -15,7 +15,8 @@ class VoiceAssistant:
             provider="gguf",
             lang="en",
             preloaded_tts: dict = None,
-            preloaded_whisper="medium",
+            preloaded_stt=None,
+            preloaded_whisper=None,  # backward compatibility with older sockets.py
             on_turn_logged=None,
     ):
         allowed_langs = ["en", "fr", "sw"]
@@ -26,10 +27,12 @@ class VoiceAssistant:
         self.source = source
         self.on_turn_logged = on_turn_logged  #  Saved as instance variable
 
+        # Prefer the new language-keyed STT store from sockets.py. If an older
+        # caller still passes preloaded_whisper, STTModule remains backward compatible.
         self.stt = STTModule(
             model_size=None,
             lang=self.lang,
-            preloaded_model=preloaded_whisper,
+            preloaded_model=preloaded_stt if preloaded_stt is not None else preloaded_whisper,
             on_speech_start=self._on_caller_speech_start,
         )
 
