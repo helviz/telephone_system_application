@@ -96,6 +96,45 @@ BAD_SILENCE_PHRASES = {
 
 
 class STTModule:
+    """
+    Streaming STT with language-routed backends.
+
+    Routing:
+      - en/sw: Sunbird/asr-whisper-large-v3-salt using the official
+        WhisperProcessor + WhisperForConditionalGeneration path. The SALT
+        language token is forced from the IVR-selected language.
+      - fr: env-configured faster-whisper model, usually WHISPER_MODEL_SIZE.
+
+    Language is always forced from the IVR-selected `lang`; no auto-detection.
+    """
+
+    # Official Sunbird/SALT Whisper language token IDs. Do not use these with
+    # base/faster-whisper models; they are for the Sunbird SALT tokenizer/model.
+    SALT_LANGUAGE_TOKENS_WHISPER = {
+        "eng": 50259,  # English (Ugandan)
+        "swa": 50318,  # Swahili
+        "ach": 50357,  # Acholi
+        "lgg": 50356,  # Lugbara
+        "lug": 50355,  # Luganda
+        "nyn": 50354,  # Runyankole
+        "teo": 50353,  # Ateso
+        "xog": 50352,  # Lusoga
+        "ttj": 50351,  # Rutooro
+        "kin": 50350,  # Kinyarwanda
+        "myx": 50349,  # Lumasaba
+    }
+
+    APP_TO_SALT_LANG = {
+        "en": "eng",
+        "sw": "swa",
+    }
+
+    FASTER_WHISPER_LANGUAGE_CODES = {
+        "en": "en",
+        "sw": "sw",
+        "fr": "fr",
+    }
+
     def __init__(self, model_size=None, device=None, lang="en", preloaded_model=None, on_speech_start=None):
         allowed_languages = ["en", "fr", "sw"]
         if lang not in allowed_languages:
@@ -104,20 +143,74 @@ class STTModule:
         self.lang = lang
         self.on_speech_start = on_speech_start
         self._last_speech_start_notify = 0.0
+        self.engine = "faster_whisper"
+        self.model = None
+        self.processor = None
+        self.device = None
+        self.salt_lang = None
 
-        if preloaded_model is not None:
-            self.model = preloaded_model
-            print(f"[STT] ♻️  Reusing preloaded Whisper model for [{lang}]")
+        # New preferred path: sockets.py/preload.py passes a language-keyed STT store:
+        # {
+        #   "en": {"engine": "sunbird_salt", "processor": processor, "model": model, "salt_lang": "eng", ...},
+        #   "sw": {"engine": "sunbird_salt", "processor": processor, "model": model, "salt_lang": "swa", ...},
+        #   "fr": {"engine": "faster_whisper", "model": french_whisper, ...},
+        # }
+        if isinstance(preloaded_model, dict) and lang in preloaded_model:
+            entry = preloaded_model[lang]
+            if isinstance(entry, dict):
+                self.engine = entry.get("engine", "faster_whisper")
+                self.model = entry.get("model")
+                self.processor = entry.get("processor")
+                self.model_name = entry.get("model_name", "unknown")
+                self.device = entry.get("device")
+                self.salt_lang = entry.get("salt_lang")
+            else:
+                # Backward compatibility for a raw language-keyed model dict.
+                self.engine = "faster_whisper"
+                self.model = entry
+                self.model_name = "preloaded"
+
+            if self.model is None:
+                raise RuntimeError(f"No STT model found for language [{lang}] in preloaded_model store.")
+            if self.engine == "sunbird_salt" and self.processor is None:
+                raise RuntimeError(f"Sunbird SALT STT for [{lang}] requires a preloaded processor.")
+
+            forced = self._forced_language_for_engine()
+            print(f"[STT] ♻️  Reusing preloaded {self.engine} STT for [{lang}] forced_language=[{forced}]")
             return
 
+        # Backward compatibility for your old single-model preload.
+        if preloaded_model is not None:
+            self.engine = "faster_whisper"
+            self.model = preloaded_model
+            self.model_name = "preloaded-faster-whisper"
+            forced = self._forced_language_for_engine()
+            print(f"[STT] ♻️  Reusing legacy Faster-Whisper model for [{lang}] forced_language=[{forced}]")
+            return
+
+        # Fallback only if no preload is provided. This keeps local dev usable.
+        if lang in {"en", "sw"} and _env_bool("USE_SUNBIRD_FOR_EN_SW", True):
+            self._load_transformers_sunbird_fallback(device=device)
+        else:
+            self._load_faster_whisper_fallback(model_size=model_size, device=device)
+
+    def _forced_language_for_engine(self) -> str:
+        if self.engine == "sunbird_salt":
+            salt_lang = self.salt_lang or self.APP_TO_SALT_LANG.get(self.lang)
+            return f"{salt_lang}:{self.SALT_LANGUAGE_TOKENS_WHISPER.get(salt_lang)}"
+        return self.FASTER_WHISPER_LANGUAGE_CODES[self.lang]
+
+    def _load_faster_whisper_fallback(self, model_size=None, device=None):
         resolved_size = model_size or os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
         resolved_device = device or os.getenv("WHISPER_DEVICE", "cpu").strip()
         compute_type = "float16" if resolved_device == "cuda" else "int8"
 
         print(
-            f"[STT] 📦 Loading Whisper [{resolved_size}] on [{resolved_device}] "
-            f"(compute_type={compute_type})..."
+            f"[STT] 📦 Loading Faster-Whisper [{resolved_size}] on [{resolved_device}] "
+            f"(compute_type={compute_type}) forced_language=[{self.FASTER_WHISPER_LANGUAGE_CODES[self.lang]}]..."
         )
+        self.engine = "faster_whisper"
+        self.model_name = resolved_size
         self.model = WhisperModel(
             resolved_size,
             device=resolved_device,
@@ -125,6 +218,38 @@ class STTModule:
             download_root=os.getenv("HF_HOME"),
         )
 
+    def _load_transformers_sunbird_fallback(self, device=None):
+        import torch
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        model_id = os.getenv("SUNBIRD_ASR_MODEL", "Sunbird/asr-whisper-large-v3-salt").strip()
+        resolved_device = device or os.getenv("SUNBIRD_ASR_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").strip()
+        if resolved_device == "cuda" and not torch.cuda.is_available():
+            print("[STT] ⚠️ SUNBIRD_ASR_DEVICE=cuda requested, but CUDA is unavailable. Falling back to CPU.")
+            resolved_device = "cpu"
+
+        torch_dtype = torch.float16 if resolved_device == "cuda" else torch.float32
+        salt_lang = self.APP_TO_SALT_LANG[self.lang]
+
+        print(
+            f"[STT] 📦 Loading Sunbird SALT ASR [{model_id}] on [{resolved_device}] "
+            f"forced_salt_language=[{salt_lang}:{self.SALT_LANGUAGE_TOKENS_WHISPER[salt_lang]}]..."
+        )
+
+        self.processor = WhisperProcessor.from_pretrained(model_id, cache_dir=os.getenv("HF_HOME"))
+        self.model = WhisperForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+            cache_dir=os.getenv("HF_HOME"),
+        ).to(resolved_device)
+        self.model.eval()
+
+        self.engine = "sunbird_salt"
+        self.model_name = model_id
+        self.device = resolved_device
+        self.salt_lang = salt_lang
 
     async def _notify_speech_start(self):
         """Notify the assistant immediately when caller speech starts."""
@@ -169,10 +294,41 @@ class STTModule:
 
     def _transcribe_blocking(self, audio_data: np.ndarray) -> list[str]:
         try:
+            if self.engine == "sunbird_salt":
+                import torch
+
+                salt_lang = self.salt_lang or self.APP_TO_SALT_LANG[self.lang]
+                salt_token_id = self.SALT_LANGUAGE_TOKENS_WHISPER[salt_lang]
+
+                # Official Sunbird/SALT forcing style:
+                #   language=processor.tokenizer.decode(SALT_LANGUAGE_TOKENS_WHISPER[lang])
+                #   forced_decoder_ids=None
+                language_token = self.processor.tokenizer.decode(salt_token_id)
+
+                input_features = self.processor(
+                    audio_data.astype(np.float32),
+                    sampling_rate=SAMPLE_RATE,
+                    return_tensors="pt",
+                ).input_features
+
+                target_device = self.device or next(self.model.parameters()).device
+                input_features = input_features.to(target_device)
+
+                with torch.no_grad():
+                    predicted_ids = self.model.generate(
+                        input_features,
+                        language=language_token,
+                        forced_decoder_ids=None,
+                    )
+
+                texts = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
+                return [text.strip() for text in texts if text and text.strip()]
+
             use_whisper_vad = _env_bool("WHISPER_INTERNAL_VAD", False)
+            forced_language = self.FASTER_WHISPER_LANGUAGE_CODES[self.lang]
 
             kwargs = {
-                "language": self.lang,
+                "language": forced_language,
                 "beam_size": _env_int("WHISPER_BEAM_SIZE", 1, 1, 10),
                 "best_of": _env_int("WHISPER_BEST_OF", 1, 1, 10),
                 "condition_on_previous_text": False,
