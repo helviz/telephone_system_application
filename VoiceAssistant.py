@@ -27,8 +27,8 @@ class VoiceAssistant:
         self.source = source
         self.on_turn_logged = on_turn_logged  #  Saved as instance variable
 
-        # Prefer the new language-keyed STT store from sockets.py. If an older
-        # caller still passes preloaded_whisper, STTModule remains backward compatible.
+        # Prefer the language-keyed OpenAI Whisper STT store from sockets.py.
+        # If an older caller still passes preloaded_whisper, STTModule remains backward compatible.
         self.stt = STTModule(
             model_size=None,
             lang=self.lang,
