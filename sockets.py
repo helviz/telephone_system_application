@@ -28,11 +28,11 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gguf").strip().lower()
 # In-process runtime store — populated by lifespan, read by WebSocket handler
 # ---------------------------------------------------------------------------
 _preloaded_tts: dict = {}
-_preloaded_whisper = None
+_preloaded_stt: dict = {}
 
 
 def _load_models():
-    global _preloaded_tts, _preloaded_whisper
+    global _preloaded_tts, _preloaded_stt
 
     print("\n" + "=" * 60)
     print("🔥 INITIALIZING SYSTEM INFRASTRUCTURE — CACHING LOCAL STRATEGIES")
@@ -41,23 +41,79 @@ def _load_models():
     total_start = time.time()
 
     # ------------------------------------------------------------------
-    # STT — Faster-Whisper
+    # STT — Mixed backend
+    #   en/sw: Sunbird/asr-whisper-large-v3-salt via transformers
+    #   fr:    Faster-Whisper from WHISPER_MODEL_SIZE env
     # ------------------------------------------------------------------
-    print("📦 [1/3] Loading Faster-Whisper...")
+    print("📦 [1/3] Loading STT: Sunbird SALT for EN/SW + Faster-Whisper for FR...")
     t = time.time()
+
     from faster_whisper import WhisperModel
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    resolved_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
-    resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if resolved_device == "cuda" else "int8"
+    sunbird_model_id = os.getenv("SUNBIRD_ASR_MODEL", "Sunbird/asr-whisper-large-v3-salt").strip()
+    resolved_device = os.getenv("WHISPER_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").strip()
+    if resolved_device == "cuda" and not torch.cuda.is_available():
+        print("   ⚠️ WHISPER_DEVICE=cuda requested, but CUDA is unavailable. Falling back to CPU.")
+        resolved_device = "cpu"
 
-    _preloaded_whisper = WhisperModel(
-        resolved_size,
+    torch_dtype = torch.float16 if resolved_device == "cuda" else torch.float32
+    sunbird_processor = WhisperProcessor.from_pretrained(
+        sunbird_model_id,
+        cache_dir=os.getenv("HF_HOME"),
+    )
+    sunbird_model = WhisperForConditionalGeneration.from_pretrained(
+        sunbird_model_id,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+        cache_dir=os.getenv("HF_HOME"),
+    ).to(resolved_device)
+    sunbird_model.eval()
+
+    french_model_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
+    faster_compute_type = "float16" if resolved_device == "cuda" else "int8"
+    french_whisper = WhisperModel(
+        french_model_size,
         device=resolved_device,
-        compute_type=compute_type,
+        compute_type=faster_compute_type,
         download_root=os.getenv("HF_HOME"),
     )
-    print(f"   ✅ Faster-Whisper loaded on {resolved_device} in {time.time() - t:.1f}s\n")
+
+    _preloaded_stt.clear()
+    _preloaded_stt.update({
+        "en": {
+            "engine": "sunbird_salt",
+            "processor": sunbird_processor,
+            "model": sunbird_model,
+            "model_name": sunbird_model_id,
+            "device": resolved_device,
+            "salt_lang": "eng",
+            "forced_language": "eng:50259",
+        },
+        "sw": {
+            "engine": "sunbird_salt",
+            "processor": sunbird_processor,
+            "model": sunbird_model,
+            "model_name": sunbird_model_id,
+            "device": resolved_device,
+            "salt_lang": "swa",
+            "forced_language": "swa:50318",
+        },
+        "fr": {
+            "engine": "faster_whisper",
+            "model": french_whisper,
+            "model_name": french_model_size,
+            "forced_language": "fr",
+        },
+    })
+
+    print(
+        "   ✅ STT ready: "
+        f"EN/SW=[{sunbird_model_id} via official SALT tokens, forced eng/swa], "
+        f"FR=[{french_model_size} via faster-whisper, forced fr], "
+        f"device=[{resolved_device}] — {time.time() - t:.1f}s\n"
+    )
 
     # ------------------------------------------------------------------
     # TTS — Soniox API configuration only
@@ -140,10 +196,12 @@ async def lifespan(fastapi_app: FastAPI):
 
     # Save active runtime engine attributes back to stats tracker
     stats.model_info["llm_provider"] = LLM_PROVIDER
-    stats.model_info["whisper_size"] = os.getenv("WHISPER_MODEL_SIZE", "medium")
+    stats.model_info["stt_en_sw"] = os.getenv("SUNBIRD_ASR_MODEL", "Sunbird/asr-whisper-large-v3-salt")
+    stats.model_info["stt_fr"] = os.getenv("WHISPER_MODEL_SIZE", "medium")
     yield
     # Free memory maps on down-scale/shutdown sequences
     _preloaded_tts.clear()
+    _preloaded_stt.clear()
 
 
 fastapi_app = FastAPI(lifespan=lifespan)
@@ -198,7 +256,7 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
         provider=LLM_PROVIDER,
         lang=lang,
         preloaded_tts=_preloaded_tts,
-        preloaded_whisper=_preloaded_whisper,
+        preloaded_stt=_preloaded_stt,
         on_turn_logged=transcript_logger_hook,  # Ensure your instance intercepts text turns
     )
 
