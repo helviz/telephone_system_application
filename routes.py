@@ -22,6 +22,7 @@ else:
     DB_PATH = os.getenv("SQLITE_DB_PATH", "voice_assistant.db")
 
 LANG_MAP = {
+    # Strict IVR enforcement: only these three digits may enter the voice pipeline.
     "1": ("en", "English"),
     "2": ("fr", "French"),
     "3": ("sw", "Swahili"),
@@ -565,7 +566,7 @@ def twilio_voice():
 def twilio_language():
     _validate_twilio()
 
-    digit = request.form.get("Digits", "")
+    digit = (request.form.get("Digits", "") or "").strip()
     if digit not in LANG_MAP:
         return _twilio_language_menu_response(IVR_INVALID_AUDIO_FILE)
 
@@ -585,7 +586,7 @@ def telnyx_voice():
 
 @app.route("/telnyx/language", methods=["POST"])
 def telnyx_language():
-    digit = request.form.get("Digits", "")
+    digit = (request.form.get("Digits", "") or "").strip()
     if digit not in LANG_MAP:
         return _telnyx_language_menu_response(IVR_INVALID_AUDIO_FILE)
 
