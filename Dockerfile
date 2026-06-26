@@ -1,8 +1,10 @@
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/app/.cache
+    HF_HOME=/data/.cache/huggingface \
+    TRANSFORMERS_CACHE=/data/.cache/huggingface \
+    HF_HUB_CACHE=/data/.cache/huggingface/hub
 
 WORKDIR /app
 
@@ -11,7 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     curl \
     ca-certificates \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
@@ -38,8 +39,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /data /app/.cache && \
-    chmod 777 /data /app/.cache && \
+RUN mkdir -p /data/.cache/huggingface /app/.cache && \
+    chmod -R 777 /data /app/.cache && \
     chmod +x /app/start.sh
 
 EXPOSE 7860
