@@ -49,80 +49,58 @@ def _load_models():
     total_start = time.time()
 
     # ------------------------------------------------------------------
-    # STT — Mixed backend
-    #   en/sw: Sunbird/asr-whisper-large-v3-salt via transformers
-    #   fr:    Faster-Whisper from WHISPER_MODEL_SIZE env
+    # STT — OpenAI Whisper via faster-whisper for all IVR-selected languages
+    #   1 -> en, 2 -> fr, 3 -> sw are enforced in routes.py.
+    #   The same model is shared across languages; language is forced per call.
     # ------------------------------------------------------------------
-    print("📦 [1/3] Loading STT: Sunbird SALT for EN/SW + Faster-Whisper for FR...")
+    print("📦 [1/3] Loading STT: OpenAI Whisper/faster-whisper for EN/FR/SW...")
     t = time.time()
 
     from faster_whisper import WhisperModel
-    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    sunbird_model_id = os.getenv("SUNBIRD_ASR_MODEL", "Sunbird/asr-whisper-large-v3-salt").strip()
-    resolved_device = os.getenv("WHISPER_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").strip()
+    whisper_model_name = (
+        os.getenv("OPENAI_WHISPER_MODEL")
+        or os.getenv("WHISPER_MODEL_SIZE")
+        or "large-v3"
+    ).strip()
+
+    resolved_device = os.getenv(
+        "WHISPER_DEVICE",
+        "cuda" if torch.cuda.is_available() else "cpu",
+    ).strip()
     if resolved_device == "cuda" and not torch.cuda.is_available():
         print("   ⚠️ WHISPER_DEVICE=cuda requested, but CUDA is unavailable. Falling back to CPU.")
         resolved_device = "cpu"
 
-    torch_dtype = torch.float16 if resolved_device == "cuda" else torch.float32
-    sunbird_processor = WhisperProcessor.from_pretrained(
-        sunbird_model_id,
-        cache_dir=os.getenv("HF_HOME"),
-    )
-    sunbird_model = WhisperForConditionalGeneration.from_pretrained(
-        sunbird_model_id,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-        cache_dir=os.getenv("HF_HOME"),
-    ).to(resolved_device)
-    sunbird_model.eval()
+    faster_compute_type = os.getenv(
+        "WHISPER_COMPUTE_TYPE",
+        "float16" if resolved_device == "cuda" else "int8",
+    ).strip()
 
-    french_model_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
-    faster_compute_type = "float16" if resolved_device == "cuda" else "int8"
-    french_whisper = WhisperModel(
-        french_model_size,
+    whisper_model = WhisperModel(
+        whisper_model_name,
         device=resolved_device,
         compute_type=faster_compute_type,
         download_root=os.getenv("HF_HOME"),
     )
 
     _preloaded_stt.clear()
-    _preloaded_stt.update({
-        "en": {
-            "engine": "sunbird_salt",
-            "processor": sunbird_processor,
-            "model": sunbird_model,
-            "model_name": sunbird_model_id,
-            "device": resolved_device,
-            "salt_lang": "eng",
-            "forced_language": "eng:50259",
-        },
-        "sw": {
-            "engine": "sunbird_salt",
-            "processor": sunbird_processor,
-            "model": sunbird_model,
-            "model_name": sunbird_model_id,
-            "device": resolved_device,
-            "salt_lang": "swa",
-            "forced_language": "swa:50318",
-        },
-        "fr": {
+    for lang in ("en", "fr", "sw"):
+        _preloaded_stt[lang] = {
             "engine": "faster_whisper",
-            "model": french_whisper,
-            "model_name": french_model_size,
-            "forced_language": "fr",
-        },
-    })
+            "model": whisper_model,
+            "model_name": whisper_model_name,
+            "device": resolved_device,
+            "forced_language": lang,
+        }
 
     stt_duration = time.time() - t
-    _safe_log_model_load("stt:sunbird_salt_en_sw_plus_faster_whisper_fr", stt_duration, resolved_device)
+    _safe_log_model_load(f"stt:openai_whisper:{whisper_model_name}", stt_duration, resolved_device)
     print(
         "   ✅ STT ready: "
-        f"EN/SW=[{sunbird_model_id} via official SALT tokens, forced eng/swa], "
-        f"FR=[{french_model_size} via faster-whisper, forced fr], "
-        f"device=[{resolved_device}] — {stt_duration:.1f}s\n"
+        f"model=[{whisper_model_name}] backend=[faster-whisper] "
+        f"forced_languages=[en, fr, sw] device=[{resolved_device}] "
+        f"compute_type=[{faster_compute_type}] — {stt_duration:.1f}s\n"
     )
 
     # ------------------------------------------------------------------
@@ -210,8 +188,8 @@ async def lifespan(fastapi_app: FastAPI):
 
     # Save active runtime engine attributes back to stats tracker
     stats.model_info["llm_provider"] = LLM_PROVIDER
-    stats.model_info["stt_en_sw"] = os.getenv("SUNBIRD_ASR_MODEL", "Sunbird/asr-whisper-large-v3-salt")
-    stats.model_info["stt_fr"] = os.getenv("WHISPER_MODEL_SIZE", "medium")
+    stats.model_info["stt"] = os.getenv("OPENAI_WHISPER_MODEL", os.getenv("WHISPER_MODEL_SIZE", "large-v3"))
+    stats.model_info["stt_languages"] = "1=en, 2=fr, 3=sw"
     yield
     # Free memory maps on down-scale/shutdown sequences
     _preloaded_tts.clear()
