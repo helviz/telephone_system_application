@@ -31,6 +31,14 @@ _preloaded_tts: dict = {}
 _preloaded_stt: dict = {}
 
 
+def _safe_log_model_load(model_name: str, duration_s: float, device: str = "cpu") -> None:
+    """Best-effort startup profiling; never fail boot because dashboard logging failed."""
+    try:
+        database.db_log_model_load(model_name, duration_s, device)
+    except Exception as exc:
+        print(f"[startup-log] Could not persist model load record for {model_name}: {exc}")
+
+
 def _load_models():
     global _preloaded_tts, _preloaded_stt
 
@@ -108,11 +116,13 @@ def _load_models():
         },
     })
 
+    stt_duration = time.time() - t
+    _safe_log_model_load("stt:sunbird_salt_en_sw_plus_faster_whisper_fr", stt_duration, resolved_device)
     print(
         "   ✅ STT ready: "
         f"EN/SW=[{sunbird_model_id} via official SALT tokens, forced eng/swa], "
         f"FR=[{french_model_size} via faster-whisper, forced fr], "
-        f"device=[{resolved_device}] — {time.time() - t:.1f}s\n"
+        f"device=[{resolved_device}] — {stt_duration:.1f}s\n"
     )
 
     # ------------------------------------------------------------------
@@ -178,15 +188,19 @@ def _load_models():
             from llmModule.LLM import LLM
             # Trigger the standard factory setup to instantiate and cache the shared Llama object
             LLM.get_model(provider="gguf", lang="en")
-            print(f"   ✅ GGUF engine compiled successfully — {time.time() - llm_start:.1f}s\n")
+            llm_duration = time.time() - llm_start
+            _safe_log_model_load("llm:gguf", llm_duration, os.getenv("WHISPER_DEVICE", "cpu"))
+            print(f"   ✅ GGUF engine compiled successfully — {llm_duration:.1f}s\n")
         except Exception as e:
             print(f"   ❌ Critical failure initializing GGUF engine: {e}")
             sys.exit(1)
     else:
         print("📦 [3/3] Using Cloud Provider. Skipping local LLM engine loading.\n")
 
-    print(
-        f"🚀 All strategies warmed up successfully! Total application boot timeline: {time.time() - total_start:.1f}s\n")
+    total_duration = time.time() - total_start
+    stats.model_info["preload_ok"] = True
+    stats.model_info["preload_duration_s"] = round(total_duration, 2)
+    print(f"🚀 All strategies warmed up successfully! Total application boot timeline: {total_duration:.1f}s\n")
 
 
 @asynccontextmanager
@@ -227,9 +241,9 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
     initial_greeting = unquote(websocket.query_params.get("InitialGreeting", "") or "").strip()
     session_id = f"{provider}:{id(websocket)}"
 
-    # COMPATIBILITY FIX: Write to memory Dashboard AND persist session entry to SQLite
+    # Record the call once. stats.call_started() already persists the session to SQLite.
+    # Do not also call database.async_start_call(), or the DB does duplicate work.
     stats.call_started(session_id, provider, lang, caller_number)
-    await database.async_start_call(session_id, provider, lang, caller_number)
 
     print("\n" + "=" * 60)
     print(f"   INBOUND CALL CONNECTED & INITIALIZED IN DB")
@@ -324,9 +338,8 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
             except (asyncio.CancelledError, Exception):
                 pass
     finally:
-        # COMPATIBILITY FIX: Clear memory slots AND calculate and update persistent duration state
+        # End the call once. stats.call_ended() already persists duration/status to SQLite.
         stats.call_ended(session_id)
-        await database.async_end_call(session_id, completed=True)
         print(f"[{provider.upper()}] Session cleaned up and written to SQLite.\n")
 
 
