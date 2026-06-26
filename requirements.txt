@@ -1,5 +1,3 @@
-kokoro==0.9.4
-omnivoice
 webrtcvad-wheels==2.0.14
 
 fastapi==0.136.1
