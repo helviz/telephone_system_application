@@ -5,12 +5,11 @@ import time
 """
 Preload / validate runtime dependencies before the server starts.
 
-    STT  — Faster-Whisper, shared by all languages
+    STT  — Mixed backend:
+            en/sw -> Sunbird/asr-whisper-large-v3-salt through transformers
+            fr    -> Faster-Whisper from WHISPER_MODEL_SIZE env
     TTS  — Soniox API using the configured voice; no local TTS weights loaded
     LLM  — GGUF via llama.cpp singleton, when local provider is enabled
-
-Soniox TTS is API-backed, so this file intentionally does NOT import/load
-Kokoro, OmniVoice, torch TTS models, or voice-design seeds.
 """
 
 print("\n" + "=" * 60)
@@ -21,26 +20,79 @@ total_start = time.time()
 
 
 # ---------------------------------------------------------------------------
-# STT — Faster-Whisper
+# STT — Sunbird SALT for English/Swahili + Faster-Whisper for French
 # ---------------------------------------------------------------------------
-print("📦 [1/3] Loading Faster-Whisper ...")
+print("📦 [1/3] Loading STT: Sunbird SALT for EN/SW + Faster-Whisper for FR ...")
 t = time.time()
 try:
+    import torch
     from faster_whisper import WhisperModel
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    whisper_device = os.getenv("WHISPER_DEVICE", "cpu").strip()
-    whisper_model_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
-    compute_type = "float16" if whisper_device == "cuda" else "int8"
+    stt_device = os.getenv("WHISPER_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").strip()
+    if stt_device == "cuda" and not torch.cuda.is_available():
+        print("   ⚠️ WHISPER_DEVICE=cuda requested, but CUDA is unavailable. Falling back to CPU.")
+        stt_device = "cpu"
 
-    _whisper = WhisperModel(
-        whisper_model_size,
-        device=whisper_device,
-        compute_type=compute_type,
+    sunbird_model_id = os.getenv("SUNBIRD_ASR_MODEL", "Sunbird/asr-whisper-large-v3-salt").strip()
+    torch_dtype = torch.float16 if stt_device == "cuda" else torch.float32
+    sunbird_processor = WhisperProcessor.from_pretrained(
+        sunbird_model_id,
+        cache_dir=os.getenv("HF_HOME"),
+    )
+    sunbird_model = WhisperForConditionalGeneration.from_pretrained(
+        sunbird_model_id,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+        cache_dir=os.getenv("HF_HOME"),
+    ).to(stt_device)
+    sunbird_model.eval()
+
+    french_whisper_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip()
+    faster_compute_type = "float16" if stt_device == "cuda" else "int8"
+    _french_whisper = WhisperModel(
+        french_whisper_size,
+        device=stt_device,
+        compute_type=faster_compute_type,
         download_root=os.getenv("HF_HOME"),
     )
-    print(f"   ✅ Whisper [{whisper_model_size}] ready on [{whisper_device}] — {time.time() - t:.1f}s\n")
+
+    _stt_store = {
+        "en": {
+            "engine": "sunbird_salt",
+            "processor": sunbird_processor,
+            "model": sunbird_model,
+            "model_name": sunbird_model_id,
+            "device": stt_device,
+            "salt_lang": "eng",
+            "forced_language": "eng:50259",
+        },
+        "sw": {
+            "engine": "sunbird_salt",
+            "processor": sunbird_processor,
+            "model": sunbird_model,
+            "model_name": sunbird_model_id,
+            "device": stt_device,
+            "salt_lang": "swa",
+            "forced_language": "swa:50318",
+        },
+        "fr": {
+            "engine": "faster_whisper",
+            "model": _french_whisper,
+            "model_name": french_whisper_size,
+            "forced_language": "fr",
+        },
+    }
+
+    print(
+        "   ✅ STT ready: "
+        f"EN/SW=[{sunbird_model_id} forced SALT tokens eng/swa], "
+        f"FR=[{french_whisper_size} forced fr], "
+        f"device=[{stt_device}] — {time.time() - t:.1f}s\n"
+    )
 except Exception as e:
-    print(f"   ❌ Whisper failed to load: {e}")
+    print(f"   ❌ STT failed to load: {e}")
     sys.exit(1)
 
 
