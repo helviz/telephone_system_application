@@ -157,7 +157,11 @@ def _telnyx_stream_response(lang: str) -> Response:
     <Connect>
         <Stream
             url="{stream_url}"
+            track="inbound_track"
+            codec="PCMU"
             bidirectionalMode="rtp"
+            bidirectionalCodec="PCMU"
+            bidirectionalSamplingRate="8000"
             statusCallback="https://{host}/telnyx/stream-status"
             statusCallbackMethod="POST" />
     </Connect>
