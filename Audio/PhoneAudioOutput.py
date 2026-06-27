@@ -165,29 +165,19 @@ class PhoneAudioOutput(AudioOutput):
         """
         Send already-encoded PCMU / G.711 μ-law / 8 kHz audio directly.
 
-        This is the clean path for Soniox when:
-            SONIOX_TTS_AUDIO_FORMAT=pcm_mulaw
-            SONIOX_TTS_SAMPLE_RATE=8000
-
-        Do not resample, normalize, fade, or re-encode here. Those operations
-        were causing chunk-by-chunk loudness pumping and rough edges when
-        realtime Soniox chunks were routed through send_audio().
+        Each call receives one Soniox real-time chunk — send it as one
+        websocket message. Do NOT re-chunk or sleep here; that introduces
+        artificial gaps between Soniox chunks and causes stuttering.
         """
         if not mulaw_audio:
             return
 
-        chunk_size = int(self.TARGET_SAMPLE_RATE * self.MULAW_BYTES_PER_SAMPLE * self.chunk_ms / 1000)
-        chunk_size = max(chunk_size, 160)
+        if self._interrupted:
+            print("[PhoneAudioOutput] Playback interrupted; dropping mu-law chunk.")
+            return
 
-        for start in range(0, len(mulaw_audio), chunk_size):
-            if self._interrupted:
-                print("[PhoneAudioOutput] Playback interrupted; dropping remaining mu-law chunks.")
-                return
-
-            chunk = mulaw_audio[start:start + chunk_size]
-            payload = base64.b64encode(chunk).decode("utf-8")
-            await self.ws.send_text(json.dumps(self._media_message(payload)))
-            await asyncio.sleep(self.chunk_ms / 1000)
+        payload = base64.b64encode(mulaw_audio).decode("utf-8")
+        await self.ws.send_text(json.dumps(self._media_message(payload)))
 
         if mark and not self._interrupted:
             await self.send_mark()
