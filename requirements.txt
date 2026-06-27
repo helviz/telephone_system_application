@@ -23,3 +23,4 @@ python-dateutil
 tenacity
 websockets
 soniox
+kokoro==0.9.4
