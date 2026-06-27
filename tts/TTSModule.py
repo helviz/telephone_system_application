@@ -33,9 +33,10 @@ def _env_optional_int(name: str) -> int | None:
 SONIOX_MODEL = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1").strip()
 SONIOX_VOICE = os.getenv("SONIOX_TTS_VOICE", "Grace").strip()
 
-# For Twilio/Telnyx phone media, request exactly what the phone stream needs:
-# 8 kHz G.711 mu-law. This avoids WAV files, resampling, and re-encoding.
-SONIOX_AUDIO_FORMAT = os.getenv("SONIOX_TTS_AUDIO_FORMAT", "pcm_mulaw").strip()
+# Preferred for phone calls. If your existing PhoneAudioOutput does not have
+# send_mulaw_audio(), this module automatically falls back to pcm_s16le/16000
+# and uses the existing send_audio() path.
+SONIOX_AUDIO_FORMAT = os.getenv("SONIOX_TTS_AUDIO_FORMAT", "pcm_mulaw").strip().lower()
 SONIOX_SAMPLE_RATE = _env_int("SONIOX_TTS_SAMPLE_RATE", 8000, 8000, 48000)
 SONIOX_BITRATE = _env_optional_int("SONIOX_TTS_BITRATE")
 SONIOX_CONNECT_TIMEOUT_SEC = float(os.getenv("SONIOX_CONNECT_TIMEOUT_SEC", "10"))
@@ -47,26 +48,28 @@ SONIOX_LANGUAGE_MAP = {
 }
 
 # Real-time text batching. This replaces the old first-sentence trick.
-# It sends small natural pieces, not whole sentences/responses.
 TTS_MIN_CHUNK_CHARS = _env_int("TTS_MIN_CHUNK_CHARS", 16, 1, 200)
 TTS_MAX_CHUNK_CHARS = _env_int("TTS_MAX_CHUNK_CHARS", 80, 10, 500)
 TTS_FLUSH_INTERVAL_MS = _env_int("TTS_FLUSH_INTERVAL_MS", 80, 0, 1000)
 
-PHONE_SAFE_FORMATS = {"pcm_mulaw", "pcm_s16le"}
+RAW_PHONE_FORMATS = {"pcm_mulaw", "pcm_s16le"}
 
 
 class TTSModule:
     """
-    Soniox real-time TTS for phone calls.
+    Soniox realtime TTS for Twilio/Telnyx phone calls.
 
-    Public interface stays the same:
+    Public interface stays unchanged:
         await speak_stream(text_generator, lang="en", on_first_audio=callback)
 
-    Design:
-      - Send LLM text chunks into Soniox immediately over the realtime SDK.
-      - Receive Soniox audio chunks concurrently.
-      - Forward each audio chunk to PhoneAudioOutput immediately.
-      - Fire on_first_audio when the first audio bytes arrive, not after synthesis ends.
+    This version does not require changing PhoneAudioOutput:
+      - If PhoneAudioOutput has send_mulaw_audio(), it uses Soniox pcm_mulaw/8000.
+      - Otherwise it uses Soniox pcm_s16le/16000 and calls the existing send_audio().
+
+    It also protects deployment from stale env vars such as:
+        SONIOX_TTS_AUDIO_FORMAT=wav
+        SONIOX_TTS_SAMPLE_RATE=16000
+    by automatically switching to a realtime phone-safe raw PCM format.
     """
 
     def __init__(self, output, preloaded_models: dict | None = None):
@@ -87,13 +90,12 @@ class TTSModule:
         print(
             "[TTS] Soniox realtime "
             f"model={SONIOX_MODEL} voice={SONIOX_VOICE} "
-            f"format={SONIOX_AUDIO_FORMAT} sample_rate={SONIOX_SAMPLE_RATE} "
+            f"env_format={SONIOX_AUDIO_FORMAT} env_sample_rate={SONIOX_SAMPLE_RATE} "
             f"text_batch={TTS_MIN_CHUNK_CHARS}-{TTS_MAX_CHUNK_CHARS} chars "
             f"flush={TTS_FLUSH_INTERVAL_MS}ms"
         )
 
     async def aclose(self):
-        """Optional cleanup hook for app shutdown."""
         client = self.client
         self.client = None
         if client is None:
@@ -120,6 +122,9 @@ class TTSModule:
         self.client = AsyncSonioxClient(api_key=api_key)
         return self.client
 
+    def _output_supports_direct_mulaw(self) -> bool:
+        return callable(getattr(self.output, "send_mulaw_audio", None))
+
     def _config_for(self, lang: str) -> dict[str, Any]:
         lang = (lang or "en").strip().lower()
         if lang not in SONIOX_LANGUAGE_MAP:
@@ -128,24 +133,48 @@ class TTSModule:
         cfg = dict(self.default_config)
         cfg["language"] = SONIOX_LANGUAGE_MAP[lang]
 
+        # sockets.py can pass a per-language config. It may still contain old
+        # values from the Hugging Face env, so we sanitize below.
         incoming = self.models.get(lang) or {}
         if isinstance(incoming, dict):
             cfg.update({k: v for k, v in incoming.items() if v is not None})
 
-        cfg["audio_format"] = str(cfg.get("audio_format") or "pcm_mulaw").strip()
+        cfg["audio_format"] = str(cfg.get("audio_format") or "pcm_mulaw").strip().lower()
         cfg["sample_rate"] = int(cfg.get("sample_rate") or 8000)
         cfg["model"] = str(cfg.get("model") or SONIOX_MODEL).strip()
         cfg["voice"] = str(cfg.get("voice") or SONIOX_VOICE).strip()
         cfg["language"] = str(cfg.get("language") or SONIOX_LANGUAGE_MAP[lang]).strip()
 
-        if cfg["audio_format"] not in PHONE_SAFE_FORMATS:
-            raise RuntimeError(
-                "For realtime phone playback, set SONIOX_TTS_AUDIO_FORMAT to "
-                "`pcm_mulaw` preferably, or `pcm_s16le`. Do not use `wav` here."
+        # Real-time phone playback should not use wav/mp3/opus/flac/aac here.
+        # If a stale env var says wav, do not crash the call; switch to a raw
+        # format that the phone output can consume immediately.
+        if cfg["audio_format"] not in RAW_PHONE_FORMATS:
+            old_format = cfg["audio_format"]
+            if self._output_supports_direct_mulaw():
+                cfg["audio_format"] = "pcm_mulaw"
+                cfg["sample_rate"] = 8000
+            else:
+                cfg["audio_format"] = "pcm_s16le"
+                cfg["sample_rate"] = 16000
+            print(
+                f"[TTS] Overriding realtime audio_format={old_format!r} to "
+                f"{cfg['audio_format']}/{cfg['sample_rate']} for phone playback."
             )
 
-        if cfg["audio_format"] == "pcm_mulaw" and cfg["sample_rate"] != 8000:
-            raise RuntimeError("For direct phone PCMU passthrough, use SONIOX_TTS_SAMPLE_RATE=8000.")
+        # Direct mu-law passthrough must be 8 kHz. If PhoneAudioOutput does not
+        # support send_mulaw_audio(), fall back to PCM16 + send_audio().
+        if cfg["audio_format"] == "pcm_mulaw":
+            if self._output_supports_direct_mulaw():
+                if cfg["sample_rate"] != 8000:
+                    print("[TTS] For pcm_mulaw, forcing SONIOX_TTS_SAMPLE_RATE=8000.")
+                cfg["sample_rate"] = 8000
+            else:
+                print(
+                    "[TTS] PhoneAudioOutput has no send_mulaw_audio(); "
+                    "using pcm_s16le/16000 through existing send_audio()."
+                )
+                cfg["audio_format"] = "pcm_s16le"
+                cfg["sample_rate"] = 16000
 
         return cfg
 
@@ -160,8 +189,7 @@ class TTSModule:
         text = str(text or "")
         if not text:
             return ""
-
-        # Keep normal leading/trailing spaces from the LLM stream so words do not join.
+        # Keep normal spaces from the LLM stream so words do not join.
         text = text.replace("helpprovide", "help provide")
         text = re.sub(r"[\t\r\n]+", " ", text)
         text = re.sub(r" {2,}", " ", text)
@@ -175,7 +203,9 @@ class TTSModule:
             return True
         if buffer[-1:] in ".!?:;\n" and len(buffer.strip()) >= 4:
             return True
-        if len(buffer) >= TTS_MIN_CHUNK_CHARS and (buffer[-1].isspace() or elapsed_ms >= TTS_FLUSH_INTERVAL_MS):
+        if len(buffer) >= TTS_MIN_CHUNK_CHARS and (
+            buffer[-1].isspace() or elapsed_ms >= TTS_FLUSH_INTERVAL_MS
+        ):
             return True
         return False
 
@@ -219,11 +249,19 @@ class TTSModule:
 
     async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
         cfg = self._config_for(lang)
+        print(
+            f"[TTS] Realtime session [{lang}] "
+            f"format={cfg['audio_format']} sample_rate={cfg['sample_rate']}"
+        )
+
         client = await self._ensure_client()
         realtime_config = self._build_realtime_config(cfg)
 
-        if hasattr(self.output, "begin_stream"):
-            self.output.begin_stream()
+        begin_stream = getattr(self.output, "begin_stream", None)
+        if callable(begin_stream):
+            result = begin_stream()
+            if inspect.isawaitable(result):
+                await result
 
         t0 = time.time()
         async with client.realtime.tts.connect(
@@ -233,7 +271,7 @@ class TTSModule:
             sender_task = asyncio.create_task(self._send_text_to_soniox(session, text_generator))
             first_audio_box = {"fired": False}
             receiver_task = asyncio.create_task(
-                self._receive_audio_from_soniox(session, cfg, t0, on_first_audio, first_audio_box)
+                self._receive_audio_chunks(session, cfg, t0, on_first_audio, first_audio_box)
             )
 
             try:
@@ -255,14 +293,21 @@ class TTSModule:
             await self._maybe_await(session.send_text_chunk(text, text_end=False))
             sent_any = True
 
-        # Always finish. If no text was sent, this cleanly terminates the stream.
         finish = getattr(session, "finish", None)
         if callable(finish):
             await self._maybe_await(finish())
-        elif sent_any:
+        else:
+            # Safe finalization even if no text was sent.
             await self._maybe_await(session.send_text_chunk("", text_end=True))
 
-    async def _receive_audio_from_soniox(self, session, cfg: dict[str, Any], t0: float, on_first_audio, first_audio_box: dict) -> None:
+    async def _receive_audio_chunks(
+        self,
+        session,
+        cfg: dict[str, Any],
+        t0: float,
+        on_first_audio,
+        first_audio_box: dict,
+    ) -> None:
         async for audio_chunk in session.receive_audio_chunks():
             if not audio_chunk:
                 continue
@@ -280,34 +325,28 @@ class TTSModule:
 
             await self._send_audio_chunk_to_phone(audio_chunk, cfg)
 
-        if hasattr(self.output, "send_mark"):
-            result = self.output.send_mark()
+        send_mark = getattr(self.output, "send_mark", None)
+        if callable(send_mark):
+            result = send_mark()
             if inspect.isawaitable(result):
                 await result
-
-    async def _receive_audio_from_soniox(self, *args, **kwargs) -> None:
-        # Kept only to make accidental old references fail safely.
-        raise RuntimeError("Use _receive_audio_from_soniox instead.")
-
-    @staticmethod
-    def _set_nonlocal_first_audio():
-        return True
 
     async def _send_audio_chunk_to_phone(self, audio_chunk: bytes, cfg: dict[str, Any]) -> None:
         audio_format = cfg["audio_format"]
         sample_rate = int(cfg["sample_rate"])
 
-        if audio_format == "pcm_mulaw" and sample_rate == 8000 and hasattr(self.output, "send_mulaw_audio"):
+        if audio_format == "pcm_mulaw" and sample_rate == 8000 and self._output_supports_direct_mulaw():
             await self.output.send_mulaw_audio(audio_chunk, mark=False)
             return
 
         if audio_format == "pcm_s16le":
+            # Existing PhoneAudioOutput.send_audio() accepts bytes as PCM16.
             await self.output.send_audio(audio_chunk, sample_rate=sample_rate)
             return
 
         raise RuntimeError(
             f"Cannot stream Soniox audio_format={audio_format!r}, sample_rate={sample_rate} "
-            "to this phone output. Use pcm_mulaw/8000 with PhoneAudioOutput.send_mulaw_audio."
+            "to this phone output. Use pcm_mulaw/8000 or pcm_s16le/16000."
         )
 
     async def _cancel_soniox_stream(self, session) -> None:
