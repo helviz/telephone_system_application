@@ -117,8 +117,8 @@ def _load_models():
 
         soniox_model = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1")
         soniox_voice = os.getenv("SONIOX_TTS_VOICE", "Grace")
-        soniox_format = os.getenv("SONIOX_TTS_AUDIO_FORMAT", "wav")
-        soniox_sample_rate = int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "24000"))
+        soniox_format = os.getenv("SONIOX_TTS_AUDIO_FORMAT", "pcm_mulaw")
+        soniox_sample_rate = int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "8000"))
 
         _preloaded_tts.clear()
         _preloaded_tts.update({
