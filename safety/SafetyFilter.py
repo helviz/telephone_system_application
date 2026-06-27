@@ -4,8 +4,10 @@ import unicodedata
 from dataclasses import dataclass, field
 
 
-def _env_bool(name: str, default: bool = True) -> bool:
+def _env_bool(name: str, default: bool = True, legacy_name: str | None = None) -> bool:
     raw = os.getenv(name)
+    if raw is None and legacy_name:
+        raw = os.getenv(legacy_name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -36,7 +38,7 @@ SAFETY_KEYWORDS: dict[str, dict[str, list[str]]] = {
             "kill myself", "suicide", "end my life", "hurt myself", "harm myself",
             "overdose myself", "i want to die", "i don't want to live",
         ],
-        "operator_request": ["operator", "human", "agent", "speak to someone", "talk to someone", "press zero"],
+        "operator_request": ["operator", "human", "agent", "speak to someone", "talk to someone"],
     },
     "fr": {
         "medical_emergency": [
@@ -55,7 +57,7 @@ SAFETY_KEYWORDS: dict[str, dict[str, list[str]]] = {
             "me suicider", "suicide", "mettre fin a ma vie", "me faire du mal",
             "me blesser", "je veux mourir", "je ne veux plus vivre",
         ],
-        "operator_request": ["operateur", "humain", "agent", "parler a quelqu'un", "parler a quelqu un", "zero"],
+        "operator_request": ["operateur", "humain", "agent", "parler a quelqu'un", "parler a quelqu un"],
     },
     "sw": {
         "medical_emergency": [
@@ -73,7 +75,7 @@ SAFETY_KEYWORDS: dict[str, dict[str, list[str]]] = {
             "kujiua", "nataka kujiua", "kujimaliza", "kumaliza maisha yangu",
             "kujiumiza", "kujidhuru", "sitaki kuishi", "nataka kufa",
         ],
-        "operator_request": ["operator", "mhudumu", "mtu", "ongea na mtu", "zungumza na mtu", "sifuri"],
+        "operator_request": ["operator", "mhudumu", "ongea na mhudumu", "zungumza na mhudumu"],
     },
 }
 
@@ -89,7 +91,8 @@ class SafetyFilter:
     """Deterministic multilingual safety filter for ASR and LLM text."""
 
     def __init__(self, enabled: bool | None = None):
-        self.enabled = _env_bool("SAFETY_FILTER_ENABLED", True) if enabled is None else enabled
+        # One global switch for latency testing. Legacy SAFETY_FILTER_ENABLED still works.
+        self.enabled = _env_bool("SAFETY_ENABLED", True, legacy_name="SAFETY_FILTER_ENABLED") if enabled is None else enabled
 
     @staticmethod
     def _normalize(text: str) -> str:
