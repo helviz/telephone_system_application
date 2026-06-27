@@ -9,7 +9,18 @@ from typing import Any
 import numpy as np
 import torch
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
 MAX_BUFFER_CHARS = int(os.getenv("TTS_MAX_BUFFER_CHARS", "80"))
+# When enabled, consume the entire LLM response and synthesize it in ONE Soniox request.
+# This avoids multiple 2s REST TTS calls for one assistant answer.
+TTS_WHOLE_RESPONSE_MODE = _env_bool("TTS_WHOLE_RESPONSE_MODE", False)
+# In normal streaming mode, this controls whether a long buffer can be spoken before punctuation.
+TTS_FLUSH_ON_MAX_CHARS = _env_bool("TTS_FLUSH_ON_MAX_CHARS", True)
 
 SONIOX_MODEL = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1")
 SONIOX_VOICE = os.getenv("SONIOX_TTS_VOICE", "Grace")
@@ -105,10 +116,33 @@ class TTSModule:
 
     async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
         """
-        Consume the LLM's async text stream, split it into natural sentence-sized
-        chunks, generate Soniox audio, and send it to PhoneAudioOutput.
+        Consume the LLM async text stream and synthesize speech.
+
+        Modes:
+        - TTS_WHOLE_RESPONSE_MODE=true:
+            Wait for the full assistant response, then call Soniox ONCE.
+            Best when Soniox REST first-audio latency is high and responses are short.
+        - TTS_WHOLE_RESPONSE_MODE=false:
+            Stream complete chunks progressively, using punctuation and optional max-char flush.
         """
         self._language_for(lang)
+
+        if TTS_WHOLE_RESPONSE_MODE:
+            full_text_parts: list[str] = []
+            async for chunk in text_generator:
+                if chunk:
+                    full_text_parts.append(str(chunk))
+
+            full_text = "".join(full_text_parts).strip()
+            if not full_text:
+                return
+
+            print(
+                f"[TTS] Whole-response mode: synthesizing one Soniox request "
+                f"({len(full_text)} chars)."
+            )
+            await self._generate_audio(full_text, lang, on_first_audio=on_first_audio)
+            return
 
         buffer = ""
         first_audio_fired = False
@@ -118,11 +152,11 @@ class TTSModule:
             if not chunk:
                 continue
 
-            buffer += chunk
+            buffer += str(chunk)
 
             should_speak = (
-                    any(p in chunk for p in sentence_endings)
-                    or len(buffer) >= MAX_BUFFER_CHARS
+                any(p in str(chunk) for p in sentence_endings)
+                or (TTS_FLUSH_ON_MAX_CHARS and len(buffer) >= MAX_BUFFER_CHARS)
             )
 
             if should_speak:
@@ -149,7 +183,7 @@ class TTSModule:
         if not buffer:
             return "", ""
 
-        if len(buffer) >= MAX_BUFFER_CHARS:
+        if TTS_FLUSH_ON_MAX_CHARS and len(buffer) >= MAX_BUFFER_CHARS:
             split_idx = buffer.rfind(" ", 0, MAX_BUFFER_CHARS)
             if split_idx != -1:
                 return buffer[:split_idx].strip(), buffer[split_idx:].strip()
