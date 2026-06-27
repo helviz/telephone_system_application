@@ -342,6 +342,6 @@ if __name__ == "__main__":
     import uvicorn
 
     _configure_logging()
-    port = int(os.getenv("PORT", 7860))
+    port = 7860
     print(f"Starting voice assistant on port {port}...")
     uvicorn.run("sockets:fastapi_app", host="0.0.0.0", port=port, log_level="info")
