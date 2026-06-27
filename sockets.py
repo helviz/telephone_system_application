@@ -104,53 +104,39 @@ def _load_models():
     )
 
     # ------------------------------------------------------------------
-    # TTS — Hybrid: local Kokoro for EN/FR, Soniox API config for SW
+    # TTS — Soniox API configuration only
     # ------------------------------------------------------------------
-    print("📦 [2/3] Configuring TTS: Kokoro(en/fr) + Soniox(sw)...")
+    print("📦 [2/3] Configuring TTS: Soniox API...")
     t = time.time()
 
     try:
-        from kokoro import KPipeline
         from soniox import SonioxClient  # noqa: F401
 
         if not os.getenv("SONIOX_API_KEY"):
-            raise RuntimeError("SONIOX_API_KEY is not set in environment/secrets. It is still needed for Swahili TTS.")
-
-        kokoro_sample_rate = int(os.getenv("KOKORO_SAMPLE_RATE", "24000"))
-        kokoro_speed = float(os.getenv("KOKORO_SPEED", "0.95"))
-        kokoro_voice_en = os.getenv("KOKORO_VOICE_EN", "af_heart")
-        kokoro_voice_fr = os.getenv("KOKORO_VOICE_FR", "ff_siwis")
-        kokoro_lang_en = os.getenv("KOKORO_LANG_CODE_EN", "a")
-        kokoro_lang_fr = os.getenv("KOKORO_LANG_CODE_FR", "f")
+            raise RuntimeError("SONIOX_API_KEY is not set in environment/secrets.")
 
         soniox_model = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1")
         soniox_voice = os.getenv("SONIOX_TTS_VOICE", "Grace")
         soniox_format = os.getenv("SONIOX_TTS_AUDIO_FORMAT", "wav")
-        soniox_sample_rate = int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "16000"))
-
-        en_start = time.time()
-        kokoro_en = KPipeline(lang_code=kokoro_lang_en)
-        _safe_log_model_load("tts:kokoro:en", time.time() - en_start, "cpu")
-
-        fr_start = time.time()
-        kokoro_fr = KPipeline(lang_code=kokoro_lang_fr)
-        _safe_log_model_load("tts:kokoro:fr", time.time() - fr_start, "cpu")
+        soniox_sample_rate = int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "24000"))
 
         _preloaded_tts.clear()
         _preloaded_tts.update({
             "en": {
-                "engine": "kokoro",
-                "pipeline": kokoro_en,
-                "voice": kokoro_voice_en,
-                "sample_rate": kokoro_sample_rate,
-                "speed": kokoro_speed,
+                "engine": "soniox",
+                "model": soniox_model,
+                "voice": soniox_voice,
+                "language": os.getenv("SONIOX_TTS_LANG_EN", "en"),
+                "audio_format": soniox_format,
+                "sample_rate": soniox_sample_rate,
             },
             "fr": {
-                "engine": "kokoro",
-                "pipeline": kokoro_fr,
-                "voice": kokoro_voice_fr,
-                "sample_rate": kokoro_sample_rate,
-                "speed": kokoro_speed,
+                "engine": "soniox",
+                "model": soniox_model,
+                "voice": soniox_voice,
+                "language": os.getenv("SONIOX_TTS_LANG_FR", "fr"),
+                "audio_format": soniox_format,
+                "sample_rate": soniox_sample_rate,
             },
             "sw": {
                 "engine": "soniox",
@@ -162,13 +148,12 @@ def _load_models():
             },
         })
         print(
-            "   ✅ TTS configured: "
-            f"en=Kokoro[{kokoro_voice_en}], fr=Kokoro[{kokoro_voice_fr}], "
-            f"sw=Soniox[{soniox_voice}/{soniox_model}] — {time.time() - t:.1f}s\n"
+            "   ✅ Soniox TTS configured "
+            f"voice=[{soniox_voice}] model=[{soniox_model}] — {time.time() - t:.1f}s\n"
         )
     except Exception as exc:
-        print(f"   ❌ Hybrid TTS configuration failed: {exc}")
-        print("   Add `kokoro==0.9.4` and `soniox` to requirements.txt, then rebuild/redeploy.")
+        print(f"   ❌ Soniox TTS configuration failed: {exc}")
+        print("   Add `soniox` to requirements.txt and set SONIOX_API_KEY in secrets/env vars.")
         raise
 
     # ------------------------------------------------------------------
@@ -357,6 +342,6 @@ if __name__ == "__main__":
     import uvicorn
 
     _configure_logging()
-    port = int(os.getenv("PORT", "7860"))
+    port = 7860
     print(f"Starting voice assistant on port {port}...")
     uvicorn.run("sockets:fastapi_app", host="0.0.0.0", port=port, log_level="info")

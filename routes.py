@@ -35,9 +35,9 @@ HELP_GREETINGS = {
 }
 
 LANGUAGE_SELECTED_PROMPTS = {
-    "en": "How can I help you?",
-    "fr": "Comment puis-je vous aider?",
-    "sw": "Nawezaje kukusaidia?",
+    "en": "English selected. How can I help you?",
+    "fr": "French selected. Comment puis-je vous aider?",
+    "sw": "Swahili selected. Nawezaje kukusaidia?",
 }
 
 IVR_GREETING = (

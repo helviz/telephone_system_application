@@ -20,54 +20,47 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 MAX_BUFFER_CHARS = int(os.getenv("TTS_MAX_BUFFER_CHARS", "120"))
 
-# Recommended phone-call mode:
+# New recommended mode for phone calls:
 #   request 1 = first complete sentence as soon as it is available
-#   request 2 = all remaining completed text after LLM finishes
+#   request 2 = the rest of the completed answer after LLM finishes
 FIRST_SENTENCE_THEN_REST = _env_bool("TTS_FIRST_SENTENCE_THEN_REST", False)
+
+# Existing modes kept for compatibility.
 WHOLE_RESPONSE_MODE = _env_bool("TTS_WHOLE_RESPONSE_MODE", False)
 SENTENCE_CHUNKS = _env_bool("TTS_SENTENCE_CHUNKS", False)
 FLUSH_ON_MAX_CHARS = _env_bool("TTS_FLUSH_ON_MAX_CHARS", True)
 DROP_INCOMPLETE_TRAILING = _env_bool("TTS_DROP_INCOMPLETE_TRAILING", True)
 
-# Local Kokoro for English/French.
-KOKORO_SAMPLE_RATE = int(os.getenv("KOKORO_SAMPLE_RATE", "24000"))
-KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.95"))
-KOKORO_VOICE_MAP = {
-    "en": os.getenv("KOKORO_VOICE_EN", "af_heart"),
-    "fr": os.getenv("KOKORO_VOICE_FR", "ff_siwis"),
-}
-KOKORO_LANG_CODE_MAP = {
-    "en": os.getenv("KOKORO_LANG_CODE_EN", "a"),
-    "fr": os.getenv("KOKORO_LANG_CODE_FR", "f"),
-}
-
-# Soniox remains for Swahili only.
 SONIOX_MODEL = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v1")
 SONIOX_VOICE = os.getenv("SONIOX_TTS_VOICE", "Grace")
 SONIOX_AUDIO_FORMAT = os.getenv("SONIOX_TTS_AUDIO_FORMAT", "wav")
-SONIOX_SAMPLE_RATE = int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "16000"))
-SONIOX_LANGUAGE_MAP = {
-    "sw": os.getenv("SONIOX_TTS_LANG_SW", "sw"),
-}
+SONIOX_SAMPLE_RATE = int(os.getenv("SONIOX_TTS_SAMPLE_RATE", "24000"))
 
-ENGINE_MAP = {
-    "en": "kokoro",
-    "fr": "kokoro",
-    "sw": "soniox",
+SONIOX_LANGUAGE_MAP = {
+    "en": os.getenv("SONIOX_TTS_LANG_EN", "en"),
+    "fr": os.getenv("SONIOX_TTS_LANG_FR", "fr"),
+    "sw": os.getenv("SONIOX_TTS_LANG_SW", "sw"),
 }
 
 
 class TTSModule:
     """
-    Hybrid TTS module for phone calls.
+    Soniox TTS for phone calls.
 
-    Language routing:
-      - en: local Kokoro voice af_heart by default
-      - fr: local Kokoro voice ff_siwis by default
-      - sw: Soniox API by default
+    Supported output strategies:
+      1. TTS_FIRST_SENTENCE_THEN_REST=true
+         - Send the first complete sentence as soon as it appears.
+         - Continue consuming the LLM stream while that first TTS request is running.
+         - After the LLM finishes, send the remaining completed text as one second request.
 
-    The public interface is unchanged:
-        await speak_stream(text_generator, lang="en", on_first_audio=callback)
+      2. TTS_WHOLE_RESPONSE_MODE=true
+         - Wait for the full LLM response, then send one TTS request.
+
+      3. TTS_SENTENCE_CHUNKS=true
+         - Send every complete sentence separately.
+
+      4. fallback legacy stream mode
+         - Similar to your earlier buffer/punctuation strategy.
     """
 
     def __init__(self, output, preloaded_models: dict | None = None):
@@ -75,15 +68,23 @@ class TTSModule:
         self.client = None
         self.models: dict[str, dict[str, Any]] = preloaded_models or {}
 
+        self.default_config = {
+            "engine": "soniox",
+            "model": SONIOX_MODEL,
+            "voice": SONIOX_VOICE,
+            "audio_format": SONIOX_AUDIO_FORMAT,
+            "sample_rate": SONIOX_SAMPLE_RATE,
+        }
+        self.language_map = dict(SONIOX_LANGUAGE_MAP)
+
         print(
-            "[TTS] hybrid="
-            "en/fr=kokoro, sw=soniox | "
+            "[TTS] mode="
             f"first_sentence_then_rest={FIRST_SENTENCE_THEN_REST}, "
             f"whole_response={WHOLE_RESPONSE_MODE}, "
             f"sentence_chunks={SENTENCE_CHUNKS}, "
             f"flush_on_max_chars={FLUSH_ON_MAX_CHARS}, "
             f"max_chars={MAX_BUFFER_CHARS}, "
-            f"kokoro_sr={KOKORO_SAMPLE_RATE}, soniox_sr={SONIOX_SAMPLE_RATE}"
+            f"sample_rate={SONIOX_SAMPLE_RATE}"
         )
 
     def _ensure_client(self):
@@ -92,7 +93,7 @@ class TTSModule:
 
         api_key = os.getenv("SONIOX_API_KEY")
         if not api_key:
-            raise RuntimeError("SONIOX_API_KEY is not set. Add it to secrets/env vars for Swahili TTS.")
+            raise RuntimeError("SONIOX_API_KEY is not set. Add it to secrets/env vars.")
 
         try:
             from soniox import SonioxClient
@@ -102,61 +103,24 @@ class TTSModule:
         self.client = SonioxClient()
         return self.client
 
-    def _ensure_bundle_loaded(self, lang: str) -> dict[str, Any]:
-        if lang not in ENGINE_MAP:
-            raise ValueError(f"Unsupported TTS language: {lang}. Choose from {list(ENGINE_MAP)}")
+    def _config_for(self, lang: str) -> dict[str, Any]:
+        if lang not in self.language_map:
+            raise ValueError(f"Unsupported TTS language: {lang}. Choose from {list(self.language_map)}")
 
-        existing = self.models.get(lang)
-        if isinstance(existing, dict):
-            return existing
+        cfg = dict(self.default_config)
+        cfg["language"] = self.language_map[lang]
 
-        engine = ENGINE_MAP[lang]
-        print(f"\n[TTS] 🧠 Lazy loading [{engine.upper()}] for [{lang.upper()}]...")
-        t_load = time.time()
+        incoming = self.models.get(lang) or {}
+        if isinstance(incoming, dict) and incoming.get("engine", "soniox") == "soniox":
+            cfg.update({k: v for k, v in incoming.items() if v is not None})
 
-        if engine == "kokoro":
-            self.models[lang] = self._load_kokoro(lang)
-        elif engine == "soniox":
-            self.models[lang] = self._soniox_config_for(lang)
-        else:
-            raise RuntimeError(f"Unsupported TTS engine: {engine}")
+        return cfg
 
-        print(f"[TTS] [{lang.upper()}] ready in {time.time() - t_load:.2f}s.\n")
-        return self.models[lang]
-
-    @staticmethod
-    def _load_kokoro(lang: str) -> dict[str, Any]:
-        try:
-            from kokoro import KPipeline
-        except Exception as exc:
-            raise RuntimeError(
-                "Kokoro is not installed. Add `kokoro==0.9.4` to requirements.txt "
-                "and rebuild/redeploy the Space."
-            ) from exc
-
-        return {
-            "engine": "kokoro",
-            "pipeline": KPipeline(lang_code=KOKORO_LANG_CODE_MAP[lang]),
-            "voice": KOKORO_VOICE_MAP[lang],
-            "sample_rate": KOKORO_SAMPLE_RATE,
-            "speed": KOKORO_SPEED,
-        }
-
-    @staticmethod
-    def _soniox_config_for(lang: str) -> dict[str, Any]:
-        if lang != "sw":
-            raise ValueError("Soniox is only configured for Swahili in this hybrid TTS module.")
-        return {
-            "engine": "soniox",
-            "model": SONIOX_MODEL,
-            "voice": SONIOX_VOICE,
-            "language": SONIOX_LANGUAGE_MAP["sw"],
-            "audio_format": SONIOX_AUDIO_FORMAT,
-            "sample_rate": SONIOX_SAMPLE_RATE,
-        }
+    def _language_for(self, lang: str) -> str:
+        return str(self._config_for(lang)["language"])
 
     async def speak_stream(self, text_generator, lang="en", on_first_audio=None):
-        self._ensure_bundle_loaded(lang)
+        self._language_for(lang)
 
         if FIRST_SENTENCE_THEN_REST:
             await self._speak_first_sentence_then_rest(text_generator, lang, on_first_audio)
@@ -173,6 +137,13 @@ class TTSModule:
         await self._speak_legacy_stream(text_generator, lang, on_first_audio)
 
     async def _speak_first_sentence_then_rest(self, text_generator, lang: str, on_first_audio=None):
+        """
+        Two-trip strategy:
+          - First Soniox request: first complete sentence only.
+          - Second Soniox request: all remaining completed text.
+
+        This lowers perceived latency without making every sentence its own API call.
+        """
         t_mode = time.time()
         first_buffer = ""
         rest_buffer = ""
@@ -197,7 +168,7 @@ class TTSModule:
                     if first_sentence:
                         cb = _first_audio_cb_once()
                         print(
-                            f"[TTS] First-sentence mode [{lang}]: request #1 "
+                            f"[TTS] First-sentence mode: request #1 "
                             f"({len(first_sentence)} chars) after {time.time() - t_mode:.2f}s."
                         )
                         first_task = asyncio.create_task(
@@ -208,10 +179,11 @@ class TTSModule:
                     rest_buffer += chunk
 
             if first_task is None:
+                # No sentence boundary arrived. Fall back to one clean request.
                 final_text = self._finalize_for_speech(first_buffer, allow_add_period=True)
                 if final_text:
                     cb = _first_audio_cb_once()
-                    print(f"[TTS] First-sentence fallback [{lang}]: one request ({len(final_text)} chars).")
+                    print(f"[TTS] First-sentence mode fallback: one request ({len(final_text)} chars).")
                     await self._generate_audio(final_text, lang, on_first_audio=cb)
                 return
 
@@ -220,10 +192,10 @@ class TTSModule:
 
             rest_text = self._finalize_for_speech(rest_buffer, allow_add_period=False)
             if rest_text:
-                print(f"[TTS] First-sentence mode [{lang}]: request #2 rest ({len(rest_text)} chars).")
+                print(f"[TTS] First-sentence mode: request #2 rest ({len(rest_text)} chars).")
                 await self._generate_audio(rest_text, lang, on_first_audio=None)
             else:
-                print(f"[TTS] First-sentence mode [{lang}]: no completed rest text to synthesize.")
+                print("[TTS] First-sentence mode: no completed rest text to synthesize.")
 
         except asyncio.CancelledError:
             if first_task and not first_task.done():
@@ -240,7 +212,7 @@ class TTSModule:
         if not text:
             return
 
-        print(f"[TTS] Whole-response mode [{lang}]: one request ({len(text)} chars).")
+        print(f"[TTS] Whole-response mode: synthesizing one Soniox request ({len(text)} chars).")
         await self._generate_audio(text, lang, on_first_audio=on_first_audio)
 
     async def _speak_sentence_chunks(self, text_generator, lang: str, on_first_audio=None):
@@ -305,11 +277,13 @@ class TTSModule:
     @staticmethod
     def _clean_text(text: str) -> str:
         text = re.sub(r"\s+", " ", (text or "").strip())
+        # Fix common stream-join artifact seen in logs: "helpprovide".
         text = text.replace("helpprovide", "help provide")
         return text
 
     @classmethod
     def _pop_first_complete_sentence(cls, buffer: str) -> tuple[str, str]:
+        """Return the first complete sentence and the remaining tail."""
         buffer = cls._clean_text(buffer)
         if not buffer:
             return "", ""
@@ -317,6 +291,9 @@ class TTSModule:
         for idx, ch in enumerate(buffer):
             if ch not in ".!?":
                 continue
+
+            # Accept punctuation as a sentence boundary if it is the end of the
+            # available buffer or followed by space/quote/closing bracket.
             next_char = buffer[idx + 1] if idx + 1 < len(buffer) else ""
             if not next_char or next_char.isspace() or next_char in "'\")]}":
                 return buffer[:idx + 1].strip(), buffer[idx + 1:].strip()
@@ -325,6 +302,7 @@ class TTSModule:
 
     @classmethod
     def _finalize_for_speech(cls, text: str, allow_add_period: bool) -> str:
+        """Avoid sending unfinished trailing phrases such as 'If the pain is'."""
         text = cls._clean_text(text)
         if not text:
             return ""
@@ -361,22 +339,13 @@ class TTSModule:
         if not text:
             return
 
-        bundle = self._ensure_bundle_loaded(lang)
         loop = asyncio.get_running_loop()
         t0 = time.time()
 
-        if bundle.get("engine") == "kokoro":
-            waveform, sample_rate = await loop.run_in_executor(
-                None,
-                lambda: self._synthesize_kokoro(text, bundle),
-            )
-        elif bundle.get("engine") == "soniox":
-            waveform, sample_rate = await loop.run_in_executor(
-                None,
-                lambda: self._synthesize_soniox(text, bundle),
-            )
-        else:
-            raise RuntimeError(f"Unsupported TTS engine: {bundle.get('engine')}")
+        waveform, sample_rate = await loop.run_in_executor(
+            None,
+            lambda: self._synthesize_soniox(text, lang),
+        )
 
         tts_elapsed = time.time() - t0
         try:
@@ -390,25 +359,9 @@ class TTSModule:
 
         await self.output.send_audio(waveform, sample_rate=sample_rate)
 
-    def _synthesize_kokoro(self, text: str, bundle: dict[str, Any]) -> tuple[torch.Tensor, int]:
-        pipeline = bundle["pipeline"]
-        generator = pipeline(
-            text,
-            voice=bundle.get("voice", KOKORO_VOICE_MAP["en"]),
-            speed=float(bundle.get("speed", KOKORO_SPEED)),
-        )
-
-        chunks: list[torch.Tensor] = []
-        for _gs, _ps, audio in generator:
-            if audio is not None:
-                chunks.append(torch.as_tensor(audio, dtype=torch.float32, device="cpu"))
-
-        waveform = self._concat_or_silence(chunks)
-        waveform = self._apply_output_envelope(waveform, int(bundle.get("sample_rate", KOKORO_SAMPLE_RATE)))
-        return waveform, int(bundle.get("sample_rate", KOKORO_SAMPLE_RATE))
-
-    def _synthesize_soniox(self, text: str, bundle: dict[str, Any]) -> tuple[torch.Tensor, int]:
+    def _synthesize_soniox(self, text: str, lang: str) -> tuple[torch.Tensor, int]:
         client = self._ensure_client()
+        cfg = self._config_for(lang)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -417,11 +370,11 @@ class TTSModule:
             client.tts.generate_to_file(
                 str(tmp_path),
                 text=text,
-                model=str(bundle.get("model", SONIOX_MODEL)),
-                language=str(bundle.get("language", SONIOX_LANGUAGE_MAP.get("sw", "sw"))),
-                voice=str(bundle.get("voice", SONIOX_VOICE)),
+                model=str(cfg.get("model", SONIOX_MODEL)),
+                language=str(cfg.get("language", self.language_map.get(lang, "en"))),
+                voice=str(cfg.get("voice", SONIOX_VOICE)),
                 audio_format="wav",
-                sample_rate=int(bundle.get("sample_rate", SONIOX_SAMPLE_RATE)),
+                sample_rate=int(cfg.get("sample_rate", SONIOX_SAMPLE_RATE)),
             )
             waveform, sample_rate = self._read_wav_as_tensor(tmp_path)
             waveform = self._apply_output_envelope(waveform, sample_rate)
@@ -431,24 +384,6 @@ class TTSModule:
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
-
-    @staticmethod
-    def _concat_or_silence(chunks: list[torch.Tensor]) -> torch.Tensor:
-        if not chunks:
-            waveform = torch.zeros(1, 1, dtype=torch.float32)
-        elif len(chunks) == 1:
-            waveform = chunks[0]
-        else:
-            waveform = torch.cat(chunks, dim=-1)
-
-        if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)
-        elif waveform.ndim > 2:
-            waveform = waveform.reshape(-1, waveform.shape[-1])[:1]
-        elif waveform.shape[0] > 1:
-            waveform = waveform[:1, :]
-
-        return waveform.to(dtype=torch.float32, device="cpu").contiguous()
 
     @staticmethod
     def _read_wav_as_tensor(path: Path) -> tuple[torch.Tensor, int]:
