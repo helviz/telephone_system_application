@@ -78,11 +78,6 @@ class PhoneStreamSource(AudioSource):
             print(f"[{self.provider.upper()}] Mark received: {name}")
             return
 
-        if event == "dtmf":
-            digit = packet.get("dtmf", {}).get("digit")
-            print(f"[{self.provider.upper()}] DTMF received over stream: {digit}")
-            return
-
         if event == "error":
             print(f"[{self.provider.upper()}] Stream error: {packet.get('payload')}")
             return
