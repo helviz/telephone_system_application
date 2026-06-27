@@ -66,6 +66,8 @@ class VoiceAssistant:
         self.asr_failure_count = 0
         self.max_asr_failures = _env_int("SAFETY_STT_FAILURE_MAX_RETRIES", 2, 1, 10)
         self._transfer_in_progress = False
+        self._assistant_audio_started_at = 0.0
+        self.barge_in_cooldown_ms = _env_int("BARGE_IN_COOLDOWN_MS", 300, 0, 2000)
 
         # Prefer the language-keyed OpenAI Whisper STT store from sockets.py.
         # If an older caller still passes preloaded_whisper, STTModule remains backward compatible.
@@ -206,7 +208,8 @@ class VoiceAssistant:
                     yield chunk
 
             def _on_first_audio():
-                stats.record_e2e_latency(time.time() - t_e2e)
+                self._assistant_audio_started_at = time.time()
+                stats.record_e2e_latency(self._assistant_audio_started_at - t_e2e)
 
             await self.tts.speak_stream(
                 _measured_llm_stream(),
@@ -269,8 +272,17 @@ class VoiceAssistant:
                 return
 
     async def _on_caller_speech_start(self):
-        """Called by STT immediately when WebRTC VAD detects new caller speech."""
+        """Called by STT after a confirmed caller speech start."""
         if self._active_task and not self._active_task.done():
+            if self.barge_in_cooldown_ms > 0 and self._assistant_audio_started_at > 0:
+                elapsed_ms = (time.time() - self._assistant_audio_started_at) * 1000
+                if elapsed_ms < self.barge_in_cooldown_ms:
+                    print(
+                        f"[VoiceAssistant] Ignored early barge-in candidate "
+                        f"({elapsed_ms:.0f}ms < {self.barge_in_cooldown_ms}ms cooldown)."
+                    )
+                    return
+
             print("[VoiceAssistant] 🎙️ Caller barge-in — stopping assistant audio now.")
             await self._clear_audio_output()
             await self._cancel_active()
