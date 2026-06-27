@@ -78,6 +78,14 @@ MAX_UTTERANCE_FRAMES = max(1, MAX_UTTERANCE_MS // FRAME_MS)
 MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 6400, 1600, 160000)
 MIN_RMS = _env_float("STT_MIN_RMS", 0.006, 0.0, 1.0)
 
+# WebRTC VAD can occasionally mark very low-energy room noise or far-end echo as speech.
+# These gates stop those false positives from starting an utterance or cancelling TTS.
+FRAME_SPEECH_MIN_RMS = _env_float("STT_FRAME_SPEECH_MIN_RMS", 0.0015, 0.0, 1.0)
+SPEECH_START_CONFIRM_MS = _env_int("STT_SPEECH_START_CONFIRM_MS", 120, FRAME_MS, 1000)
+SPEECH_START_CONFIRM_FRAMES = max(1, SPEECH_START_CONFIRM_MS // FRAME_MS)
+SPEECH_START_MIN_RMS = _env_float("STT_SPEECH_START_MIN_RMS", 0.003, 0.0, 1.0)
+BARGE_IN_MIN_RMS = _env_float("STT_BARGE_IN_MIN_RMS", 0.006, 0.0, 1.0)
+
 # Extra protection against Whisper hallucinating common phrases on silence/noise.
 # The length gate means real longer utterances containing these words are not blocked.
 HALLUCINATION_MAX_SAMPLES = _env_int("STT_HALLUCINATION_MAX_SAMPLES", 24000, 1600, 160000)
@@ -292,12 +300,18 @@ class STTModule:
         audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         return np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
 
+    @classmethod
+    def _frame_rms(cls, frame: bytes) -> float:
+        return cls._rms(cls._bytes_to_float_audio(frame))
+
     async def transcribe_stream(self, audio_source: AudioSource):
         print(
             f"--- STT Active: Listening [{self.lang}] "
             f"VAD={VAD_AGGRESSIVENESS}, silence={END_SILENCE_MS}ms, "
             f"final_grace={FINAL_GRACE_MS}ms, "
-            f"padding={PADDING_MS}ms, min_samples={MIN_SAMPLES}, min_rms={MIN_RMS} ---"
+            f"padding={PADDING_MS}ms, min_samples={MIN_SAMPLES}, min_rms={MIN_RMS}, "
+            f"frame_rms_gate={FRAME_SPEECH_MIN_RMS}, start_confirm={SPEECH_START_CONFIRM_MS}ms, "
+            f"start_min_rms={SPEECH_START_MIN_RMS}, barge_min_rms={BARGE_IN_MIN_RMS} ---"
         )
 
         loop = asyncio.get_running_loop()
@@ -311,6 +325,8 @@ class STTModule:
         maybe_done = False
         grace_frames = 0
         grace_resets = 0
+        start_candidate_frames = 0
+        start_candidate_rms_total = 0.0
 
         async def _flush(frames: list[bytes]):
             t_flush_start = time.time()
@@ -377,27 +393,53 @@ class STTModule:
 
                 for frame in frames:
                     try:
-                        is_speech = vad.is_speech(frame, SAMPLE_RATE)
+                        vad_speech = vad.is_speech(frame, SAMPLE_RATE)
                     except Exception:
-                        is_speech = False
+                        vad_speech = False
+
+                    frame_rms = self._frame_rms(frame)
+                    is_speech = vad_speech and frame_rms >= FRAME_SPEECH_MIN_RMS
 
                     if not in_speech:
                         ring_pad.append(frame)
 
                         if is_speech:
-                            in_speech = True
-                            trailing_silence = 0
-                            maybe_done = False
-                            grace_frames = 0
-                            grace_resets = 0
-                            t_speech_start = time.time()
-                            print(f"[STT][{t_speech_start:.3f}] Speech start detected.")
-                            await self._notify_speech_start()
+                            start_candidate_frames += 1
+                            start_candidate_rms_total += frame_rms
+                            avg_start_rms = start_candidate_rms_total / max(1, start_candidate_frames)
 
-                            # Include a small amount of pre-speech padding so Whisper
-                            # does not lose the beginning of the caller's first word.
-                            utterance_frames = list(ring_pad)
-                            utterance_frames.append(frame)
+                            # Do not enter speech state on a single WebRTC VAD hit.
+                            # Require a short run of real-energy frames first. This keeps
+                            # quiet room noise / distant audio from cancelling assistant TTS.
+                            if (
+                                start_candidate_frames >= SPEECH_START_CONFIRM_FRAMES
+                                and avg_start_rms >= SPEECH_START_MIN_RMS
+                            ):
+                                in_speech = True
+                                trailing_silence = 0
+                                maybe_done = False
+                                grace_frames = 0
+                                grace_resets = 0
+                                t_speech_start = time.time()
+                                print(
+                                    f"[STT][{t_speech_start:.3f}] Speech start confirmed "
+                                    f"({SPEECH_START_CONFIRM_MS}ms, avg_rms={avg_start_rms:.5f})."
+                                )
+
+                                if avg_start_rms >= BARGE_IN_MIN_RMS:
+                                    await self._notify_speech_start()
+                                else:
+                                    print(
+                                        f"[STT][{time.time():.3f}] Speech start kept for STT but not used "
+                                        f"for barge-in (avg_rms={avg_start_rms:.5f} < {BARGE_IN_MIN_RMS})."
+                                    )
+
+                                # Include a small amount of pre-speech padding so Whisper
+                                # does not lose the beginning of the caller's first word.
+                                utterance_frames = list(ring_pad)
+                        else:
+                            start_candidate_frames = 0
+                            start_candidate_rms_total = 0.0
 
                         continue
 
@@ -449,6 +491,8 @@ class STTModule:
                         maybe_done = False
                         grace_frames = 0
                         grace_resets = 0
+                        start_candidate_frames = 0
+                        start_candidate_rms_total = 0.0
                         ring_pad.clear()
 
         except asyncio.CancelledError:
