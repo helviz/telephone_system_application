@@ -26,9 +26,11 @@ class PhoneAudioOutput(AudioOutput):
       - G.711 mu-law / PCMU
       - base64 inside provider websocket media events
 
-    New realtime path:
-      - send_mulaw_audio() forwards Soniox pcm_mulaw/8000 chunks directly.
-      - send_audio() remains as a compatibility path for PCM16/float audio.
+    Provider differences:
+      - Twilio outbound media must include streamSid after the start event.
+      - Telnyx bidirectional RTP mode accepts media events with only
+        {"event":"media","media":{"payload":"..."}}. The payload is the
+        base64-encoded RTP payload without RTP headers.
     """
 
     PROVIDERS = {"twilio", "telnyx"}
@@ -52,19 +54,18 @@ class PhoneAudioOutput(AudioOutput):
         self._interrupted = False
 
     def set_stream_sid(self, sid: str | None):
+        """Backward-compatible setter used by sockets.py after start event."""
         self.stream_sid = sid
         self.stream_id = sid
 
     def set_stream_id(self, stream_id: str | None):
+        """Provider-neutral stream id setter."""
         self.stream_id = stream_id
         self.stream_sid = stream_id
 
-    def begin_stream(self):
-        """Reset interruption state at the beginning of a new assistant utterance."""
-        self._interrupted = False
-
     @staticmethod
     def _to_float_mono(audio: Any) -> np.ndarray:
+        """Convert torch/bytes/numpy/list audio into mono float32 in [-1, 1]."""
         if isinstance(audio, torch.Tensor):
             audio_np = audio.detach().cpu().numpy()
         elif isinstance(audio, bytes):
@@ -86,6 +87,7 @@ class PhoneAudioOutput(AudioOutput):
 
     @staticmethod
     def _prepare_for_phone(audio_np: np.ndarray) -> np.ndarray:
+        """Basic mastering for narrowband telephone playback."""
         if audio_np.size == 0:
             return audio_np.astype(np.float32)
 
@@ -105,6 +107,7 @@ class PhoneAudioOutput(AudioOutput):
 
     @classmethod
     def _resample_to_phone_rate(cls, audio_np: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Resample to 8 kHz with anti-aliasing where possible."""
         if sample_rate == cls.TARGET_SAMPLE_RATE:
             return audio_np.astype(np.float32, copy=False)
 
@@ -127,8 +130,11 @@ class PhoneAudioOutput(AudioOutput):
             "event": "media",
             "media": {"payload": payload},
         }
+
+        # Twilio requires streamSid. Telnyx bidirectional RTP mode does not.
         if self.provider == "twilio" and self.stream_sid:
             message["streamSid"] = self.stream_sid
+
         return message
 
     def _mark_message(self) -> dict:
@@ -137,15 +143,22 @@ class PhoneAudioOutput(AudioOutput):
             "event": "mark",
             "mark": {"name": f"tts_{PhoneAudioOutput._mark_counter}"},
         }
+
         if self.provider == "twilio" and self.stream_sid:
             message["streamSid"] = self.stream_sid
+
         return message
 
-    async def send_mark(self):
-        if not self._interrupted:
-            await self.ws.send_text(json.dumps(self._mark_message()))
 
     async def clear(self):
+        """
+        Interrupt outbound assistant audio.
+
+        Twilio supports a websocket ``clear`` event, which drops provider-side
+        media that has been queued but not yet played. Telnyx RTP-style media
+        cannot recall packets already sent, but this still stops this app from
+        sending the remaining chunks.
+        """
         self._interrupted = True
 
         if self.provider == "twilio" and self.stream_sid:
@@ -159,17 +172,19 @@ class PhoneAudioOutput(AudioOutput):
             except Exception as e:
                 print(f"[PhoneAudioOutput] Failed to send Twilio clear event: {e}")
 
-    async def send_mulaw_audio(self, mulaw: bytes, mark: bool = False):
-        """
-        Send already-encoded 8 kHz G.711 mu-law audio.
+    async def send_audio(self, audio: Any, sample_rate: int = 16000):
+        self._interrupted = False
 
-        This is the fastest path for Soniox realtime when configured with:
-            audio_format=pcm_mulaw
-            sample_rate=8000
-        """
-        if not mulaw:
-            return
+        audio_np = self._to_float_mono(audio)
+        audio_8k = self._resample_to_phone_rate(audio_np, sample_rate)
+        audio_8k = self._prepare_for_phone(audio_8k)
 
+        pcm_8k = (audio_8k * 32767.0).astype(np.int16).tobytes()
+        mulaw = audioop.lin2ulaw(pcm_8k, 2)
+
+        # 20 ms is the safest packet size for PSTN-style PCMU streams.
+        # Send in real time instead of dumping the whole TTS file into the
+        # provider buffer. This makes barge-in cancellation responsive.
         chunk_size = int(self.TARGET_SAMPLE_RATE * self.MULAW_BYTES_PER_SAMPLE * self.chunk_ms / 1000)
         chunk_size = max(chunk_size, 160)
 
@@ -183,19 +198,8 @@ class PhoneAudioOutput(AudioOutput):
             await self.ws.send_text(json.dumps(self._media_message(payload)))
             await asyncio.sleep(self.chunk_ms / 1000)
 
-        if mark:
-            await self.send_mark()
-
-    async def send_audio(self, audio: Any, sample_rate: int = 16000):
-        self.begin_stream()
-
-        audio_np = self._to_float_mono(audio)
-        audio_8k = self._resample_to_phone_rate(audio_np, sample_rate)
-        audio_8k = self._prepare_for_phone(audio_8k)
-
-        pcm_8k = (audio_8k * 32767.0).astype(np.int16).tobytes()
-        mulaw = audioop.lin2ulaw(pcm_8k, 2)
-        await self.send_mulaw_audio(mulaw, mark=True)
+        if not self._interrupted:
+            await self.ws.send_text(json.dumps(self._mark_message()))
 
     @classmethod
     def twilio(cls, websocket, chunk_ms: int = DEFAULT_CHUNK_MS) -> "PhoneAudioOutput":
