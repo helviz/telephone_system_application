@@ -205,7 +205,7 @@ class GGUFStrategy(LLMStrategy):
 
         generation_kwargs: dict[str, Any] = {
             "messages": cast(Any, messages),
-            "stream": True,
+            "stream": False,  # consumed synchronously inside the thread — see below
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "120")),
             "temperature": float(os.getenv("LLM_TEMPERATURE", "0.35")),
             "top_p": float(os.getenv("LLM_TOP_P", "0.85")),
@@ -213,7 +213,9 @@ class GGUFStrategy(LLMStrategy):
             "repeat_penalty": float(os.getenv("LLM_REPEAT_PENALTY", "1.10")),
             "stop": [
                 "<|im_end|>",
-                "<think>",  # hard stop if thinking starts
+                # NOTE: "<think>" intentionally omitted — it appears in the assistant
+                # prefill (`<think>\n\n</think>`) and would cause an immediate stop
+                # before any real content is generated.
                 "User:",
                 "user:",
                 "\nUser:",
@@ -227,30 +229,37 @@ class GGUFStrategy(LLMStrategy):
             # Supported by newer llama-cpp-python / llama.cpp Qwen chat templates.
             generation_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
 
-        def get_stream():
+        def run_and_collect() -> str:
+            """
+            Runs the full (non-streaming) inference on a worker thread so the
+            event loop is never blocked.  Returns the generated text directly.
+            Streaming inside asyncio.to_thread is unsafe because the lazy
+            generator would be consumed on the event-loop thread, blocking it
+            for the entire generation duration.
+            """
+            kwargs = dict(generation_kwargs)
             try:
-                return self.llm.create_chat_completion(**generation_kwargs)
+                result = self.llm.create_chat_completion(**kwargs)
             except TypeError as e:
-                # Older llama-cpp-python may not accept chat_template_kwargs.
                 if "chat_template_kwargs" not in str(e):
                     raise
-                generation_kwargs.pop("chat_template_kwargs", None)
+                kwargs.pop("chat_template_kwargs", None)
                 print("[GGUF] chat_template_kwargs unsupported; falling back to /no_think prompt only.")
-                return self.llm.create_chat_completion(**generation_kwargs)
+                result = self.llm.create_chat_completion(**kwargs)
 
-        # Offload the blocking synchronous create_chat_completion call safely.
-        stream = await asyncio.to_thread(get_stream)
+            return result["choices"][0]["message"].get("content", "") or ""
+
+        raw_text = await asyncio.to_thread(run_and_collect)
 
         print("AI (Local): ", end="", flush=True)
         think_filter = ThinkTagStreamFilter()
 
-        for chunk in stream:
-            delta = chunk.get("choices", [{}])[0].get("delta", {})
-            content = delta.get("content", "")
-            if not content:
-                continue
-
-            clean_content = think_filter.feed(content) if self.disable_thinking else content
+        # Yield the response word-by-word so TTS can start as soon as the first
+        # sentence arrives rather than waiting for the entire response.
+        words = raw_text.split(" ")
+        for i, word in enumerate(words):
+            chunk = word if i == len(words) - 1 else word + " "
+            clean_content = think_filter.feed(chunk) if self.disable_thinking else chunk
             if clean_content:
                 print(clean_content, end="", flush=True)
                 yield clean_content
