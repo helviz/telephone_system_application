@@ -37,9 +37,9 @@ class ASRConfidenceChecker:
     """Reliability gate for Whisper/faster-whisper outputs."""
 
     def __init__(self):
-        self.avg_logprob_threshold = _env_float("ASR_LOW_CONF_AVG_LOGPROB", -1.0)
-        self.no_speech_threshold = _env_float("ASR_HIGH_NO_SPEECH_PROB", 0.60)
-        self.compression_threshold = _env_float("ASR_HIGH_COMPRESSION_RATIO", 2.4)
+        self.avg_logprob_threshold = _env_float("ASR_LOW_CONF_AVG_LOGPROB", -0.8)
+        self.no_speech_threshold = _env_float("ASR_HIGH_NO_SPEECH_PROB", 0.45)
+        self.compression_threshold = _env_float("ASR_HIGH_COMPRESSION_RATIO", 2.2)
         self.min_chars = _env_int("ASR_MIN_TEXT_CHARS", 3)
 
     def check(self, result: TranscriptionResult | str | None) -> tuple[bool, list[str]]:
