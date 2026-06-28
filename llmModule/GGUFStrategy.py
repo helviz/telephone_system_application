@@ -81,7 +81,7 @@ def _get_llm(model_path: str | None = None) -> Llama:
     if _llm_instance is None:
         resolved_path = _resolve_model_path(model_path)
         gpu_layers = int(os.getenv("N_GPU_LAYERS", "0"))
-        ctx_size = int(os.getenv("N_CTX", "2048"))
+        ctx_size = int(os.getenv("LLM_N_CTX", "768"))
 
         print(f"[GGUF] Allocating engine instance (happens once): {resolved_path}")
         print(f"[GGUF] Strategy constraints -> N_CTX: {ctx_size} | N_GPU_LAYERS: {gpu_layers}")
@@ -202,9 +202,11 @@ class GGUFStrategy(LLMStrategy):
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "120")),
             "temperature": float(os.getenv("LLM_TEMPERATURE", "0.35")),
             "top_p": float(os.getenv("LLM_TOP_P", "0.85")),
-            "repeat_penalty": float(os.getenv("LLM_REPEAT_PENALTY", "1.30")),
+            "top_k": int(os.getenv("LLM_TOP_K", "20")),
+            "repeat_penalty": float(os.getenv("LLM_REPEAT_PENALTY", "1.10")),
             "stop": [
                 "<|im_end|>",
+                "<think>",  # hard stop if thinking starts
                 "User:",
                 "user:",
                 "\nUser:",
