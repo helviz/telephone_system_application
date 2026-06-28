@@ -65,6 +65,8 @@ SAFETY_KEYWORDS: dict[str, dict[str, list[str]]] = {
             "kifua kinauma", "amepoteza fahamu", "hapumui", "hataki kuamka", "damu nyingi",
             "kutokwa na damu nyingi", "degedege", "mshtuko", "kiharusi", "mshtuko wa moyo",
             "sumu", "amekunywa sumu", "kuzidisha dawa", "amezidisha dawa", "kuungua sana",
+            "mtoto hazungumzi", "nimepigwa risasi", "kichwa kinauma sana", "tumbo linauma sana",
+            "amekula sumu", "maumivu ya kuzaa",
         ],
         "violence": [
             "wananishambulia", "ananivamia", "ana bunduki", "bunduki", "kisu", "napigwa",
