@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     build-essential \
     cmake \
+    ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
@@ -24,10 +25,8 @@ RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Build from source against the actual CUDA 12.8 in the image
-# This guarantees correct GPU code and chat_template_kwargs support
-RUN pip install --no-cache-dir llama-cpp-python==0.3.22 \
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu128
+# Build from source against actual CUDA 12.8 — no prebuilt wheel exists for cu128
+RUN pip install --no-cache-dir llama-cpp-python==0.3.22 --no-binary llama-cpp-python
 
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
