@@ -90,6 +90,9 @@ def _get_llm(model_path: str | None = None) -> Llama:
             model_path=resolved_path,
             n_ctx=ctx_size,
             n_gpu_layers=gpu_layers,
+            n_batch=512,
+            n_threads=os.cpu_count() or 4,
+            verbose=False,
         )
         print("[GGUF] Engine compiled successfully and cached for active runtime sessions.")
     else:
@@ -194,6 +197,10 @@ class GGUFStrategy(LLMStrategy):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input},
+            # Pre-fill empty think block so the model skips thinking entirely
+            # and starts generating real content immediately.
+            # Required because chat_template_kwargs is unsupported on this build.
+            {"role": "assistant", "content": "<think>\n\n</think>\n\n"},
         ]
 
         generation_kwargs: dict[str, Any] = {
