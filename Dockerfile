@@ -4,7 +4,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/data/.cache/huggingface \
     TRANSFORMERS_CACHE=/data/.cache/huggingface \
-    HF_HUB_CACHE=/data/.cache/huggingface/hub
+    HF_HUB_CACHE=/data/.cache/huggingface/hub \
+    CMAKE_ARGS="-DGGML_CUDA=on" \
+    FORCE_CMAKE=1
 
 WORKDIR /app
 
@@ -13,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     curl \
     ca-certificates \
+    build-essential \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
@@ -20,8 +24,10 @@ RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-RUN pip install --no-cache-dir --prefer-binary llama-cpp-python==0.3.22 \
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+# Build from source against the actual CUDA 12.8 in the image
+# This guarantees correct GPU code and chat_template_kwargs support
+RUN pip install --no-cache-dir llama-cpp-python==0.3.22 \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu128
 
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
