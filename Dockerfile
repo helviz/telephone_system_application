@@ -4,9 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/data/.cache/huggingface \
     TRANSFORMERS_CACHE=/data/.cache/huggingface \
-    HF_HUB_CACHE=/data/.cache/huggingface/hub \
-    CMAKE_ARGS="-DGGML_CUDA=on" \
-    FORCE_CMAKE=1
+    HF_HUB_CACHE=/data/.cache/huggingface/hub
 
 WORKDIR /app
 
@@ -15,9 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     curl \
     ca-certificates \
-    build-essential \
-    cmake \
-    ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
@@ -25,8 +20,8 @@ RUN rm -f /opt/conda/lib/libstdc++.so.6 && \
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Build from source against actual CUDA 12.8 — no prebuilt wheel exists for cu128
-RUN pip install --no-cache-dir llama-cpp-python==0.3.22 --no-binary llama-cpp-python
+RUN pip install --no-cache-dir --prefer-binary llama-cpp-python==0.3.22 \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 
 RUN pip install --no-cache-dir \
     faster-whisper==1.2.1 \
