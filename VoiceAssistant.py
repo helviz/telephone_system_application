@@ -120,10 +120,7 @@ class VoiceAssistant:
         await self._log_turn("assistant", message)
 
     async def _transfer_to_operator(self, reason: str) -> bool:
-        if self._transfer_in_progress:
-            return True
-
-        self._transfer_in_progress = True
+        self._transfer_in_progress = True  # remove the early-return guard here
         provider = getattr(self.source, "provider", "")
         call_id = getattr(self.source, "call_control_id", None)
 
@@ -139,10 +136,15 @@ class VoiceAssistant:
         return ok
 
     async def _handle_safety_escalation(self, message_key: str, reason: str):
+        self._transfer_in_progress = True  # block any re-entry immediately
         await self._cancel_active()
         await self._clear_audio_output()
-        await self._speak_fixed_message(message_key)
-        await self._transfer_to_operator(reason)
+
+        # Fire transfer and TTS at the same time
+        await asyncio.gather(
+            self._speak_fixed_message(message_key),
+            self._transfer_to_operator(reason),
+        )
 
     async def _handle_asr_failure(self, reasons: list[str]):
         self.asr_failure_count += 1
@@ -297,10 +299,15 @@ class VoiceAssistant:
                 pass
         self._active_task = None
 
+
     async def start(self):
         print(f"--- Voice Assistant Active [{self.lang.upper()}] ---")
         try:
             async for result in self.stt.transcribe_stream(self.source):
+
+                if self._transfer_in_progress:
+                    break
+
                 text = self._text_from_transcription(result)
 
                 if self.safety_enabled:
