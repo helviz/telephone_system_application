@@ -175,7 +175,10 @@ class EscalationManager:
             f'<Dial timeout="{timeout_int}"{caller_id_attr}{dial_action_attr}>'
             f'<Number{status_attrs}>{escape(self.operator_number)}</Number>'
             '</Dial>'
-            '<Say>I could not connect you to an operator. Please call the nearest health worker or community leader now.</Say>'
+            '<Say voice="Amazon.Joanna" language="en-US">'
+            'I could not connect you to an operator. '
+            'Please call the nearest health worker or community leader now.'
+            '</Say>'
             '</Response>'
         )
 
