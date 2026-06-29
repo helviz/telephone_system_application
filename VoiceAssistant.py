@@ -116,7 +116,13 @@ class VoiceAssistant:
         async def _one_chunk():
             yield message
 
-        await self.tts.speak_stream(_one_chunk(), lang=self.lang, on_first_audio=None)
+        try:
+            await self.tts.speak_stream(_one_chunk(), lang=self.lang, on_first_audio=None)
+        except RuntimeError as e:
+            if "websocket" in str(e).lower() or "asgi" in str(e).lower():
+                print(f"[VoiceAssistant] WebSocket closed before safety message could be sent; skipping TTS.")
+            else:
+                raise
         await self._log_turn("assistant", message)
 
     async def _transfer_to_operator(self, reason: str) -> bool:
@@ -136,14 +142,14 @@ class VoiceAssistant:
         return ok
 
     async def _handle_safety_escalation(self, message_key: str, reason: str):
-        self._transfer_in_progress = True  # block any re-entry immediately
+        self._transfer_in_progress = True
         await self._cancel_active()
         await self._clear_audio_output()
 
-        # Fire transfer and TTS at the same time
         await asyncio.gather(
-            self._speak_fixed_message(message_key),
+            self._speak_fixed_message(message_key),  # now swallows WebSocket errors
             self._transfer_to_operator(reason),
+            return_exceptions=True,
         )
 
     async def _handle_asr_failure(self, reasons: list[str]):
