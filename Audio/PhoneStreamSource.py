@@ -100,7 +100,12 @@ class PhoneStreamSource(AudioSource):
         else:
             self.stream_id = packet.get("stream_id") or start.get("stream_id")
             self.stream_sid = self.stream_id
-            self.call_control_id = start.get("call_control_id")
+            self.call_control_id = (
+                    start.get("callSid")
+                    or start.get("call_control_id")
+                    or packet.get("callSid")
+                    or packet.get("CallSid")
+            )
 
             try:
                 self.input_sample_rate = int(start.get("sample_rate") or self.DEFAULT_PHONE_SAMPLE_RATE)
@@ -117,6 +122,12 @@ class PhoneStreamSource(AudioSource):
             f"stream_id={self.stream_id}, sample_rate={self.input_sample_rate}, "
             f"channels={self.input_channels}"
         )
+
+        if self.call_control_id:
+            print(f"[{self.provider.upper()}] CallSid captured for escalation: {self.call_control_id}")
+        else:
+            print(
+                f"[{self.provider.upper()}] WARNING: CallSid not found. Packet keys: {list(packet.keys())}, Start keys: {list(start.keys())}")
 
     async def _handle_media(self, packet: dict[str, Any]):
         media = packet.get("media", {}) or {}
