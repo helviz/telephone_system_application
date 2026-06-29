@@ -651,3 +651,9 @@ def dashboard_system_logs():
 
     html_lines.append("</div></div>")
     return "".join(html_lines)
+
+@app.route("/telnyx/transfer-status", methods=["POST"])
+def telnyx_transfer_status():
+    data = request.get_json(silent=True) or dict(request.form)
+    print(f"[Transfer Status] {data}")
+    return Response("", status=204)
