@@ -154,6 +154,8 @@ class EscalationManager:
 
         status_callback = self._telnyx_transfer_status_callback(lang=lang, reason=reason)
         status_attrs = ""
+        dial_action_attr = ""
+
         if status_callback:
             status_attrs = (
                 f" statusCallback={quoteattr(status_callback)}"
@@ -161,12 +163,19 @@ class EscalationManager:
                 ' statusCallbackMethod="POST"'
             )
 
+            # This is useful for final Dial result / failure logging.
+            dial_action_attr = (
+                f" action={quoteattr(status_callback)}"
+                ' method="POST"'
+            )
+
         return (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response>'
-            f'<Dial timeout="{timeout_int}"{caller_id_attr}>'
+            f'<Dial timeout="{timeout_int}"{caller_id_attr}{dial_action_attr}>'
             f'<Number{status_attrs}>{escape(self.operator_number)}</Number>'
             '</Dial>'
+            '<Say>I could not connect you to an operator. Please call the nearest health worker or community leader now.</Say>'
             '</Response>'
         )
 
