@@ -304,7 +304,13 @@ async def handle_media_stream(websocket: WebSocket, provider: str, lang: str):
                     output.set_stream_sid(source.stream_sid)
 
         except WebSocketDisconnect:
-            print(f"\n❌ [{provider.upper()}] Caller hung up")
+            if getattr(assistant, "_transfer_in_progress", False):
+                print(
+                    f"\n[{provider.upper()}] Bot media stream closed — call handed off to "
+                    "operator transfer (this is expected, not a hangup)."
+                )
+            else:
+                print(f"\n❌ [{provider.upper()}] Caller hung up")
         except Exception as e:
             print(f"\n[{provider.upper()}] Receiver error: {e}")
 
