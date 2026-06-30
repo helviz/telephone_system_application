@@ -52,6 +52,7 @@ class EscalationManager:
         reason: str,
         twilio_call_sid: str | None = None,
         telnyx_call_control_id: str | None = None,
+        spoken_message: str | None = None,
     ) -> bool:
         if not self.enabled:
             print(f"[Escalation] Transfer disabled. reason={reason}")
@@ -67,7 +68,7 @@ class EscalationManager:
             if provider == "telnyx":
                 # For TeXML apps this value must be the Telnyx CallSid from the
                 # TeXML/websocket request, not the Call Control ID.
-                return await self._transfer_telnyx(telnyx_call_control_id, lang, reason)
+                return await self._transfer_telnyx(telnyx_call_control_id, lang, reason, spoken_message)
             print(f"[Escalation] Unknown provider={provider!r}; cannot transfer.")
             return False
         except Exception as exc:
@@ -100,12 +101,24 @@ class EscalationManager:
         print(f"[Escalation][Twilio] Updated live call {call_sid} to transfer URL.")
         return True
 
-    async def _transfer_telnyx(self, live_call_id: str | None, lang: str, reason: str) -> bool:
+    async def _transfer_telnyx(
+        self,
+        live_call_id: str | None,
+        lang: str,
+        reason: str,
+        spoken_message: str | None = None,
+    ) -> bool:
         if self.telnyx_transfer_mode in {"call_control", "call-control", "voice_api", "voice-api"}:
             return await self._transfer_telnyx_call_control(live_call_id, reason)
-        return await self._transfer_telnyx_texml(live_call_id, lang, reason)
+        return await self._transfer_telnyx_texml(live_call_id, lang, reason, spoken_message)
 
-    async def _transfer_telnyx_texml(self, call_sid: str | None, lang: str, reason: str) -> bool:
+    async def _transfer_telnyx_texml(
+        self,
+        call_sid: str | None,
+        lang: str,
+        reason: str,
+        spoken_message: str | None = None,
+    ) -> bool:
         """Transfer a live TeXML call to OPERATOR_PHONE_NUMBER using <Dial><Number>."""
         if not call_sid:
             print("[Escalation][Telnyx TeXML] Missing CallSid; cannot update live TeXML call.")
@@ -124,7 +137,7 @@ class EscalationManager:
             print("[Escalation][Telnyx TeXML] TELNYX_API_KEY malformed: remove spaces, quotes, or Bearer prefix.")
             return False
 
-        texml = self._build_telnyx_transfer_texml(lang=lang, reason=reason)
+        texml = self._build_telnyx_transfer_texml(lang=lang, reason=reason, spoken_message=spoken_message)
         url = f"https://api.telnyx.com/v2/texml/Accounts/{quote(account_sid, safe='')}/Calls/{quote(call_sid, safe='')}"
         payload = {"Texml": texml}
         headers = {
@@ -142,7 +155,13 @@ class EscalationManager:
         print(f"[Escalation][Telnyx TeXML] Live call updated to <Dial><Number>. reason={reason}")
         return True
 
-    def _build_telnyx_transfer_texml(self, *, lang: str, reason: str) -> str:
+    def _build_telnyx_transfer_texml(
+        self,
+        *,
+        lang: str,
+        reason: str,
+        spoken_message: str | None = None,
+    ) -> str:
         timeout = os.getenv("TELNYX_TRANSFER_TIMEOUT_SECS", "30").strip() or "30"
         try:
             timeout_int = max(5, min(120, int(timeout)))
@@ -169,9 +188,27 @@ class EscalationManager:
                 ' method="POST"'
             )
 
+        # IMPORTANT: This <Say> plays on the live call itself via the TeXML
+        # engine, NOT through the bot's WebSocket TTS pipeline. The Update
+        # Call request below tears down the bot's media Stream the moment
+        # Telnyx applies it, so any message that depends on that Stream
+        # (e.g. VoiceAssistant's own TTS) will be cut off mid-sentence.
+        # Putting the message here keeps it in the same atomic call update
+        # as the Dial, so it always finishes playing before the bridge to
+        # the operator begins — and the caller stays connected the whole
+        # time, ending up live with the operator on one continuous call.
+        say_block = ""
+        if spoken_message:
+            say_block = (
+                '<Say voice="Telnyx.NaturalHD.Astra" language="en-US">'
+                f'{escape(spoken_message)}'
+                '</Say>'
+            )
+
         return (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response>'
+            f'{say_block}'
             f'<Dial timeout="{timeout_int}"{caller_id_attr}{dial_action_attr}>'
             f'<Number{status_attrs}>{escape(self.operator_number)}</Number>'
             '</Dial>'
