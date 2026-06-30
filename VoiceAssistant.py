@@ -125,7 +125,7 @@ class VoiceAssistant:
                 raise
         await self._log_turn("assistant", message)
 
-    async def _transfer_to_operator(self, reason: str) -> bool:
+    async def _transfer_to_operator(self, reason: str, spoken_message: str | None = None) -> bool:
         self._transfer_in_progress = True  # remove the early-return guard here
         provider = getattr(self.source, "provider", "")
         call_id = getattr(self.source, "call_control_id", None)
@@ -136,6 +136,7 @@ class VoiceAssistant:
             reason=reason,
             twilio_call_sid=call_id if provider == "twilio" else None,
             telnyx_call_control_id=call_id if provider == "telnyx" else None,
+            spoken_message=spoken_message,
         )
         if not ok:
             await self._speak_fixed_message("transfer_failed")
@@ -146,11 +147,29 @@ class VoiceAssistant:
         await self._cancel_active()
         await self._clear_audio_output()
 
-        await asyncio.gather(
-            self._speak_fixed_message(message_key),  # now swallows WebSocket errors
-            self._transfer_to_operator(reason),
-            return_exceptions=True,
-        )
+        message_text = get_safety_message(self.lang, message_key)
+        provider = getattr(self.source, "provider", "")
+
+        if provider == "telnyx":
+            # Telnyx's TeXML Update Call tears down the bot's WebSocket media
+            # Stream the instant it's applied, so playing the safety message
+            # through our own TTS pipeline in parallel is a race we usually
+            # lose (message gets cut off, caller hears silence and hangs up
+            # — this is exactly what the "WebSocket closed before safety
+            # message could be sent" log line means). Instead, hand the
+            # message text to the transfer itself so it's spoken via <Say>
+            # inside the same TeXML response as the <Dial>, guaranteeing it
+            # plays in full before the bridge to the operator starts, with
+            # the caller staying connected throughout.
+            print(f"[Safety Message][{self.lang}] {message_key}: {message_text}")
+            await self._log_turn("assistant", message_text)
+            await self._transfer_to_operator(reason, spoken_message=message_text)
+        else:
+            await asyncio.gather(
+                self._speak_fixed_message(message_key),
+                self._transfer_to_operator(reason),
+                return_exceptions=True,
+            )
 
     async def _handle_asr_failure(self, reasons: list[str]):
         self.asr_failure_count += 1
