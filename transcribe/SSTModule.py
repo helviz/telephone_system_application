@@ -1,22 +1,24 @@
 import asyncio
 import collections
+import json
 import os
 import time
+from contextlib import suppress
 
 import numpy as np
 import webrtcvad
 from dotenv import load_dotenv
-from faster_whisper import WhisperModel
 
 from Audio.AudioSource import AudioSource
 
 load_dotenv()
 
-# WebRTC VAD requires mono PCM16 frames at 8, 16, 32, or 48 kHz.
 # PhoneStreamSource normalizes Twilio/Telnyx phone audio to 16 kHz PCM16.
 SAMPLE_RATE = 16000
 FRAME_MS = 20
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # int16 = 2 bytes
+
+SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 
 
 def _env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
@@ -54,72 +56,51 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# Defaults tuned for low-latency narrowband phone speech after upsampling to 16 kHz.
-# These can still be overridden from Hugging Face / Docker env variables.
+# Existing Whisper/VAD defaults. They are still used when USE_WHISPER=true.
 VAD_AGGRESSIVENESS = _env_int("WEBRTC_VAD_AGGRESSIVENESS", 1, 0, 3)
-
-# Two-stage turn finalization for phone calls:
-#   1. END_SILENCE_MS marks a possible end-of-speech.
-#   2. FINAL_GRACE_MS waits a little longer before yielding text to the LLM.
-# If the caller resumes during the grace window, the pending flush is cancelled
-# and the new audio is merged into the same utterance.
 END_SILENCE_MS = _env_int("STT_END_SILENCE_MS", 500, 200, 3000)
 END_SILENCE_FRAMES = max(1, END_SILENCE_MS // FRAME_MS)
-
 FINAL_GRACE_MS = _env_int("STT_FINAL_GRACE_MS", 1000, 0, 3000)
 FINAL_GRACE_FRAMES = max(0, FINAL_GRACE_MS // FRAME_MS)
-
 PADDING_MS = _env_int("STT_PADDING_MS", 250, 0, 2000)
 PADDING_FRAMES = max(1, PADDING_MS // FRAME_MS)
-
 MAX_UTTERANCE_MS = _env_int("STT_MAX_UTTERANCE_MS", 20_000, 1000, 120_000)
 MAX_UTTERANCE_FRAMES = max(1, MAX_UTTERANCE_MS // FRAME_MS)
-
 MIN_SAMPLES = _env_int("STT_MIN_SAMPLES", 6400, 1600, 160000)
 MIN_RMS = _env_float("STT_MIN_RMS", 0.006, 0.0, 1.0)
-
-# WebRTC VAD can occasionally mark very low-energy room noise or far-end echo as speech.
-# These gates stop those false positives from starting an utterance or cancelling TTS.
 FRAME_SPEECH_MIN_RMS = _env_float("STT_FRAME_SPEECH_MIN_RMS", 0.0015, 0.0, 1.0)
 SPEECH_START_CONFIRM_MS = _env_int("STT_SPEECH_START_CONFIRM_MS", 120, FRAME_MS, 1000)
 SPEECH_START_CONFIRM_FRAMES = max(1, SPEECH_START_CONFIRM_MS // FRAME_MS)
 SPEECH_START_MIN_RMS = _env_float("STT_SPEECH_START_MIN_RMS", 0.003, 0.0, 1.0)
 BARGE_IN_MIN_RMS = _env_float("STT_BARGE_IN_MIN_RMS", 0.006, 0.0, 1.0)
-
-# Extra protection against Whisper hallucinating common phrases on silence/noise.
-# The length gate means real longer utterances containing these words are not blocked.
 HALLUCINATION_MAX_SAMPLES = _env_int("STT_HALLUCINATION_MAX_SAMPLES", 24000, 1600, 160000)
 BAD_SILENCE_PHRASES = {
-    "thank you",
-    "thank you.",
-    "thanks",
-    "thanks.",
-    "you",
-    "you.",
-    "asante",
-    "asante.",
-    "merci",
-    "merci.",
+    "thank you", "thank you.", "thanks", "thanks.", "you", "you.",
+    "asante", "asante.", "merci", "merci.",
 }
 
 
 class STTModule:
     """
-    Streaming STT for phone calls using OpenAI Whisper through faster-whisper.
+    Streaming STT for phone calls.
 
-    The caller's IVR digit is the source of truth for language selection:
-      - digit 1 in routes.py -> lang="en" -> Whisper language="en"
-      - digit 2 in routes.py -> lang="fr" -> Whisper language="fr"
-      - digit 3 in routes.py -> lang="sw" -> Whisper language="sw"
+    Backend selection:
+      - USE_WHISPER=true  -> local faster-whisper, using your existing VAD/final-grace logic.
+      - USE_WHISPER=false -> Soniox realtime STT WebSocket, model stt-rt-v5 by default.
 
-    There is no Sunbird/SALT path and no language auto-detection.
+    The caller's IVR digit remains the source of truth for language selection:
+      - digit 1 in routes.py -> lang="en"
+      - digit 2 in routes.py -> lang="fr"
+      - digit 3 in routes.py -> lang="sw"
     """
 
     ALLOWED_LANGUAGES = ("en", "fr", "sw")
-    WHISPER_LANGUAGE_CODES = {
-        "en": "en",
-        "fr": "fr",
-        "sw": "sw",
+    WHISPER_LANGUAGE_CODES = {"en": "en", "fr": "fr", "sw": "sw"}
+    SONIOX_LANGUAGE_HINTS = {
+        "en": ["en"],
+        "fr": ["fr"],
+        # Soniox uses ISO-style language hints. "sw" is the standard code for Swahili.
+        "sw": ["sw"],
     }
 
     def __init__(self, model_size=None, device=None, lang="en", preloaded_model=None, on_speech_start=None):
@@ -129,14 +110,18 @@ class STTModule:
         self.lang = lang
         self.on_speech_start = on_speech_start
         self._last_speech_start_notify = 0.0
-        self.engine = "faster_whisper"
+        self.use_whisper = _env_bool("USE_WHISPER", True)
+        self.engine = "faster_whisper" if self.use_whisper else "soniox_realtime"
         self.model = None
         self.model_name = "unknown"
         self.device = None
 
+        if not self.use_whisper:
+            self._configure_soniox()
+            return
+
         # Preferred path: sockets.py passes a language-keyed STT store. Each
-        # language entry points to the same preloaded OpenAI Whisper model, but
-        # keeps the forced language code explicit for logs and safety checks.
+        # language entry points to the same preloaded OpenAI Whisper model.
         if isinstance(preloaded_model, dict) and lang in preloaded_model:
             entry = preloaded_model[lang]
             if isinstance(entry, dict):
@@ -163,7 +148,6 @@ class STTModule:
             )
             return
 
-        # Backward compatibility for an old raw shared model object.
         if preloaded_model is not None:
             self.model = preloaded_model
             self.model_name = "preloaded-openai-whisper"
@@ -173,46 +157,11 @@ class STTModule:
             )
             return
 
-        # Fallback only if no preload is provided. This keeps local dev usable.
         self._load_faster_whisper_fallback(model_size=model_size, device=device)
 
-    @staticmethod
-    def _resolve_model_name(model_size=None) -> str:
-        """Read the Whisper model from dotenv/env, with old env compatibility."""
-        return (
-            model_size
-            or os.getenv("OPENAI_WHISPER_MODEL")
-            or os.getenv("WHISPER_MODEL_SIZE")
-            or "large-v3"
-        ).strip()
-
-    @staticmethod
-    def _resolve_device(device=None) -> str:
-        return (device or os.getenv("WHISPER_DEVICE") or "cpu").strip()
-
-    @staticmethod
-    def _resolve_compute_type(device: str) -> str:
-        return (os.getenv("WHISPER_COMPUTE_TYPE") or ("float16" if device == "cuda" else "int8")).strip()
-
-    def _load_faster_whisper_fallback(self, model_size=None, device=None):
-        resolved_size = self._resolve_model_name(model_size)
-        resolved_device = self._resolve_device(device)
-        compute_type = self._resolve_compute_type(resolved_device)
-
-        print(
-            f"[STT] 📦 Loading OpenAI Whisper/faster-whisper [{resolved_size}] on [{resolved_device}] "
-            f"(compute_type={compute_type}) forced_language=[{self.WHISPER_LANGUAGE_CODES[self.lang]}]..."
-        )
-        self.engine = "faster_whisper"
-        self.model_name = resolved_size
-        self.device = resolved_device
-        self.model = WhisperModel(
-            resolved_size,
-            device=resolved_device,
-            compute_type=compute_type,
-            download_root=os.getenv("HF_HOME"),
-        )
-
+    # ------------------------------------------------------------------
+    # Common helpers
+    # ------------------------------------------------------------------
     async def _notify_speech_start(self):
         """Notify the assistant immediately when caller speech starts."""
         if not self.on_speech_start:
@@ -241,21 +190,329 @@ class STTModule:
     def _normalize_text(text: str) -> str:
         return " ".join(text.strip().lower().split())
 
+    @staticmethod
+    def _bytes_to_float_audio(audio_bytes: bytes) -> np.ndarray:
+        if len(audio_bytes) % 2 != 0:
+            audio_bytes = audio_bytes[:-1]
+        audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        return np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+
+    @classmethod
+    def _frame_rms(cls, frame: bytes) -> float:
+        return cls._rms(cls._bytes_to_float_audio(frame))
+
+    @staticmethod
+    def _frame_generator(byte_stream_buffer: bytearray) -> list[bytes]:
+        """Consume complete 20 ms PCM16 frames and keep any partial remainder."""
+        frames = []
+        offset = 0
+        while offset + FRAME_BYTES <= len(byte_stream_buffer):
+            frames.append(bytes(byte_stream_buffer[offset:offset + FRAME_BYTES]))
+            offset += FRAME_BYTES
+        del byte_stream_buffer[:offset]
+        return frames
+
+    # ------------------------------------------------------------------
+    # Soniox realtime backend
+    # ------------------------------------------------------------------
+    def _configure_soniox(self):
+        self.engine = "soniox_realtime"
+        self.model_name = os.getenv("SONIOX_STT_MODEL", "stt-rt-v5").strip() or "stt-rt-v5"
+        self.soniox_api_key = os.getenv("SONIOX_API_KEY", "").strip()
+        if not self.soniox_api_key:
+            raise RuntimeError("USE_WHISPER=false requires SONIOX_API_KEY in env/secrets.")
+
+        self.soniox_url = os.getenv("SONIOX_STT_WS_URL", SONIOX_WS_URL).strip() or SONIOX_WS_URL
+        self.soniox_audio_format = os.getenv("SONIOX_STT_AUDIO_FORMAT", "pcm_s16le").strip() or "pcm_s16le"
+        self.soniox_sample_rate = _env_int("SONIOX_STT_SAMPLE_RATE", SAMPLE_RATE, 8000, 48000)
+        self.soniox_num_channels = _env_int("SONIOX_STT_NUM_CHANNELS", 1, 1, 2)
+        self.soniox_endpoint_detection = _env_bool("SONIOX_STT_ENDPOINT_DETECTION", True)
+        self.soniox_language_hints_strict = _env_bool("SONIOX_STT_LANGUAGE_HINTS_STRICT", True)
+        self.soniox_max_endpoint_delay_ms = _env_int("SONIOX_STT_MAX_ENDPOINT_DELAY_MS", 900, 500, 3000)
+        self.soniox_endpoint_sensitivity = _env_float("SONIOX_STT_ENDPOINT_SENSITIVITY", 0.2, -1.0, 1.0)
+        self.soniox_endpoint_latency_level = _env_int("SONIOX_STT_ENDPOINT_LATENCY_LEVEL", 1, 0, 3)
+        self.soniox_keepalive_seconds = _env_int("SONIOX_STT_KEEPALIVE_SECONDS", 10, 5, 19)
+        self.soniox_manual_finalize = _env_bool("SONIOX_STT_MANUAL_FINALIZATION", False)
+
+        hints_env = os.getenv(f"SONIOX_STT_LANG_HINTS_{self.lang.upper()}", "").strip()
+        self.soniox_language_hints = (
+            [x.strip() for x in hints_env.split(",") if x.strip()]
+            if hints_env else self.SONIOX_LANGUAGE_HINTS[self.lang]
+        )
+
+        print(
+            f"[STT] 🌐 Soniox realtime configured: model=[{self.model_name}] "
+            f"lang_hints={self.soniox_language_hints} strict={self.soniox_language_hints_strict} "
+            f"audio={self.soniox_audio_format}/{self.soniox_sample_rate}Hz "
+            f"endpoint_detection={self.soniox_endpoint_detection} "
+            f"manual_finalize={self.soniox_manual_finalize}"
+        )
+
+    def _soniox_config(self) -> dict:
+        config = {
+            "api_key": self.soniox_api_key,
+            "model": self.model_name,
+            "audio_format": self.soniox_audio_format,
+            "language_hints": self.soniox_language_hints,
+            "language_hints_strict": self.soniox_language_hints_strict,
+            "enable_endpoint_detection": self.soniox_endpoint_detection,
+            "client_reference_id": f"voice-assistant-{self.lang}",
+        }
+
+        if self.soniox_audio_format != "auto":
+            config["sample_rate"] = self.soniox_sample_rate
+            config["num_channels"] = self.soniox_num_channels
+
+        if self.soniox_endpoint_detection:
+            config["max_endpoint_delay_ms"] = self.soniox_max_endpoint_delay_ms
+            config["endpoint_sensitivity"] = self.soniox_endpoint_sensitivity
+            config["endpoint_latency_adjustment_level"] = self.soniox_endpoint_latency_level
+
+        return config
+
+    @staticmethod
+    def _tokens_to_text(tokens: list[dict]) -> str:
+        return "".join(str(t.get("text", "")) for t in tokens if t.get("text") not in {"<end>", "<fin>"}).strip()
+
+    async def _soniox_sender(self, ws, audio_source: AudioSource, result_queue: asyncio.Queue):
+        """Send PCM16 chunks to Soniox and optionally run local VAD for barge-in/manual finalize."""
+        vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        byte_buffer = bytearray()
+        last_audio_at = time.time()
+        last_keepalive_at = time.time()
+        in_speech = False
+        trailing_silence = 0
+        speech_confirm_frames = 0
+        speech_rms_total = 0.0
+        sent_any_audio = False
+
+        async def maybe_keepalive():
+            nonlocal last_keepalive_at
+            now = time.time()
+            if now - last_audio_at >= self.soniox_keepalive_seconds and now - last_keepalive_at >= self.soniox_keepalive_seconds:
+                await ws.send(json.dumps({"type": "keepalive"}))
+                last_keepalive_at = now
+                print(f"[STT][Soniox] keepalive sent after {now - last_audio_at:.1f}s without audio")
+
+        try:
+            async for chunk in audio_source.get_stream():
+                if not chunk or not isinstance(chunk, (bytes, bytearray)):
+                    await maybe_keepalive()
+                    await asyncio.sleep(0)
+                    continue
+
+                # Send every chunk to Soniox so semantic endpointing has full context.
+                await ws.send(bytes(chunk))
+                sent_any_audio = True
+                last_audio_at = time.time()
+
+                # Local VAD is only for fast barge-in notification and optional manual finalization.
+                byte_buffer.extend(chunk)
+                frames = self._frame_generator(byte_buffer)
+                for frame in frames:
+                    try:
+                        vad_speech = vad.is_speech(frame, SAMPLE_RATE)
+                    except Exception:
+                        vad_speech = False
+
+                    frame_rms = self._frame_rms(frame)
+                    is_speech = vad_speech and frame_rms >= FRAME_SPEECH_MIN_RMS
+
+                    if not in_speech:
+                        if is_speech:
+                            speech_confirm_frames += 1
+                            speech_rms_total += frame_rms
+                            avg_rms = speech_rms_total / max(1, speech_confirm_frames)
+                            if speech_confirm_frames >= SPEECH_START_CONFIRM_FRAMES and avg_rms >= SPEECH_START_MIN_RMS:
+                                in_speech = True
+                                trailing_silence = 0
+                                print(f"[STT][Soniox] Local speech start confirmed avg_rms={avg_rms:.5f}")
+                                if avg_rms >= BARGE_IN_MIN_RMS:
+                                    await self._notify_speech_start()
+                        else:
+                            speech_confirm_frames = 0
+                            speech_rms_total = 0.0
+                        continue
+
+                    if is_speech:
+                        trailing_silence = 0
+                    else:
+                        trailing_silence += 1
+
+                    if self.soniox_manual_finalize and in_speech and trailing_silence >= END_SILENCE_FRAMES:
+                        # Soniox recommends finalizing only after ~200ms silence after speech.
+                        await ws.send(json.dumps({"type": "finalize"}))
+                        print(f"[STT][Soniox] manual finalize sent after {END_SILENCE_MS}ms silence")
+                        in_speech = False
+                        trailing_silence = 0
+                        speech_confirm_frames = 0
+                        speech_rms_total = 0.0
+
+                await maybe_keepalive()
+
+            # Audio source ended. Gracefully end Soniox stream.
+            if sent_any_audio:
+                await ws.send(b"")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await result_queue.put({"type": "error", "message": f"Soniox sender error: {exc}"})
+
+    async def _soniox_receiver(self, ws, result_queue: asyncio.Queue):
+        final_tokens: list[dict] = []
+        turn_started_at: float | None = None
+
+        try:
+            async for raw in ws:
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    print(f"[STT][Soniox] Non-JSON response ignored: {raw!r}")
+                    continue
+
+                if event.get("error_code") or event.get("error_type"):
+                    await result_queue.put({
+                        "type": "error",
+                        "message": f"Soniox error {event.get('error_code')} {event.get('error_type')}: {event.get('error_message')}",
+                    })
+                    return
+
+                if event.get("finished"):
+                    if final_tokens:
+                        await result_queue.put({"type": "text", "text": self._tokens_to_text(final_tokens), "started_at": turn_started_at})
+                    await result_queue.put({"type": "done"})
+                    return
+
+                tokens = event.get("tokens") or []
+                if not tokens:
+                    continue
+
+                has_endpoint = any(t.get("text") == "<end>" for t in tokens)
+                has_finalize = any(t.get("text") == "<fin>" for t in tokens)
+                real_tokens = [t for t in tokens if t.get("text") not in {"<end>", "<fin>"}]
+
+                if real_tokens and turn_started_at is None:
+                    turn_started_at = time.time()
+                    # Backup speech-start signal if local VAD missed it.
+                    await self._notify_speech_start()
+
+                for token in real_tokens:
+                    if token.get("is_final"):
+                        final_tokens.append(token)
+
+                if has_endpoint or has_finalize:
+                    text = self._tokens_to_text(final_tokens)
+                    final_tokens = []
+                    if text:
+                        await result_queue.put({"type": "text", "text": text, "started_at": turn_started_at})
+                    turn_started_at = None
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await result_queue.put({"type": "error", "message": f"Soniox receiver error: {exc}"})
+
+    async def _transcribe_soniox_stream(self, audio_source: AudioSource):
+        try:
+            import websockets
+        except Exception as exc:
+            raise RuntimeError(
+                "USE_WHISPER=false requires the `websockets` package. Add `websockets` to requirements.txt."
+            ) from exc
+
+        print(
+            f"--- STT Active: Soniox realtime [{self.lang}] model={self.model_name}, "
+            f"endpoint_delay={self.soniox_max_endpoint_delay_ms}ms, "
+            f"endpoint_sensitivity={self.soniox_endpoint_sensitivity}, "
+            f"latency_level={self.soniox_endpoint_latency_level} ---"
+        )
+
+        result_queue: asyncio.Queue = asyncio.Queue()
+        async with websockets.connect(self.soniox_url, ping_interval=15, ping_timeout=15, max_size=None) as ws:
+            await ws.send(json.dumps(self._soniox_config()))
+            sender_task = asyncio.create_task(self._soniox_sender(ws, audio_source, result_queue))
+            receiver_task = asyncio.create_task(self._soniox_receiver(ws, result_queue))
+
+            try:
+                while True:
+                    item = await result_queue.get()
+                    kind = item.get("type")
+
+                    if kind == "text":
+                        text = (item.get("text") or "").strip()
+                        if not text:
+                            continue
+                        started_at = item.get("started_at")
+                        if started_at:
+                            with suppress(Exception):
+                                import stats
+                                stats.record_stt_latency(time.time() - started_at)
+                        print(f"[STT][Soniox] Final turn -> {text!r}")
+                        yield text
+
+                    elif kind == "error":
+                        print(f"[STT][Soniox] ⚠️ {item.get('message')}")
+                        break
+
+                    elif kind == "done":
+                        break
+            finally:
+                for task in (sender_task, receiver_task):
+                    task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await task
+
+    # ------------------------------------------------------------------
+    # faster-whisper backend (your existing implementation)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_model_name(model_size=None) -> str:
+        return (
+            model_size
+            or os.getenv("OPENAI_WHISPER_MODEL")
+            or os.getenv("WHISPER_MODEL_SIZE")
+            or "large-v3"
+        ).strip()
+
+    @staticmethod
+    def _resolve_device(device=None) -> str:
+        return (device or os.getenv("WHISPER_DEVICE") or "cpu").strip()
+
+    @staticmethod
+    def _resolve_compute_type(device: str) -> str:
+        return (os.getenv("WHISPER_COMPUTE_TYPE") or ("float16" if device == "cuda" else "int8")).strip()
+
+    def _load_faster_whisper_fallback(self, model_size=None, device=None):
+        from faster_whisper import WhisperModel
+
+        resolved_size = self._resolve_model_name(model_size)
+        resolved_device = self._resolve_device(device)
+        compute_type = self._resolve_compute_type(resolved_device)
+
+        print(
+            f"[STT] 📦 Loading OpenAI Whisper/faster-whisper [{resolved_size}] on [{resolved_device}] "
+            f"(compute_type={compute_type}) forced_language=[{self.WHISPER_LANGUAGE_CODES[self.lang]}]..."
+        )
+        self.engine = "faster_whisper"
+        self.model_name = resolved_size
+        self.device = resolved_device
+        self.model = WhisperModel(
+            resolved_size,
+            device=resolved_device,
+            compute_type=compute_type,
+            download_root=os.getenv("HF_HOME"),
+        )
+
     def _is_likely_silence_hallucination(self, text: str, audio_len_samples: int, rms: float) -> bool:
         normalized = self._normalize_text(text)
         if not normalized:
             return True
-
-        # Whisper often emits these on silence/noise. Only suppress them for short
-        # and low-energy clips so genuine user speech is not removed.
         if normalized in BAD_SILENCE_PHRASES:
             if audio_len_samples <= HALLUCINATION_MAX_SAMPLES or rms < (MIN_RMS * 1.5):
                 return True
-
         return False
 
     def _transcribe_blocking(self, audio_data: np.ndarray) -> list[str]:
-        """Run OpenAI Whisper/faster-whisper with the IVR-selected language forced."""
         try:
             use_whisper_vad = _env_bool("WHISPER_INTERNAL_VAD", False)
             forced_language = self.WHISPER_LANGUAGE_CODES[self.lang]
@@ -282,31 +539,9 @@ class STTModule:
             print(f"[STT] ⚠️  Transcription error (chunk discarded): {e}")
             return []
 
-    @staticmethod
-    def _frame_generator(byte_stream_buffer: bytearray) -> list[bytes]:
-        """Consume complete 20 ms PCM16 frames and keep any partial remainder."""
-        frames = []
-        offset = 0
-        while offset + FRAME_BYTES <= len(byte_stream_buffer):
-            frames.append(bytes(byte_stream_buffer[offset:offset + FRAME_BYTES]))
-            offset += FRAME_BYTES
-        del byte_stream_buffer[:offset]
-        return frames
-
-    @staticmethod
-    def _bytes_to_float_audio(audio_bytes: bytes) -> np.ndarray:
-        if len(audio_bytes) % 2 != 0:
-            audio_bytes = audio_bytes[:-1]
-        audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        return np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-
-    @classmethod
-    def _frame_rms(cls, frame: bytes) -> float:
-        return cls._rms(cls._bytes_to_float_audio(frame))
-
-    async def transcribe_stream(self, audio_source: AudioSource):
+    async def _transcribe_whisper_stream(self, audio_source: AudioSource):
         print(
-            f"--- STT Active: Listening [{self.lang}] "
+            f"--- STT Active: Whisper [{self.lang}] "
             f"VAD={VAD_AGGRESSIVENESS}, silence={END_SILENCE_MS}ms, "
             f"final_grace={FINAL_GRACE_MS}ms, "
             f"padding={PADDING_MS}ms, min_samples={MIN_SAMPLES}, min_rms={MIN_RMS}, "
@@ -374,11 +609,9 @@ class STTModule:
                 cleaned_texts.append(text)
 
             if cleaned_texts:
-                try:
+                with suppress(Exception):
                     import stats
                     stats.record_stt_latency(stt_elapsed)
-                except Exception:
-                    pass
 
             for text in cleaned_texts:
                 yield text
@@ -408,9 +641,6 @@ class STTModule:
                             start_candidate_rms_total += frame_rms
                             avg_start_rms = start_candidate_rms_total / max(1, start_candidate_frames)
 
-                            # Do not enter speech state on a single WebRTC VAD hit.
-                            # Require a short run of real-energy frames first. This keeps
-                            # quiet room noise / distant audio from cancelling assistant TTS.
                             if (
                                 start_candidate_frames >= SPEECH_START_CONFIRM_FRAMES
                                 and avg_start_rms >= SPEECH_START_MIN_RMS
@@ -434,8 +664,6 @@ class STTModule:
                                         f"for barge-in (avg_rms={avg_start_rms:.5f} < {BARGE_IN_MIN_RMS})."
                                     )
 
-                                # Include a small amount of pre-speech padding so Whisper
-                                # does not lose the beginning of the caller's first word.
                                 utterance_frames = list(ring_pad)
                         else:
                             start_candidate_frames = 0
@@ -443,13 +671,9 @@ class STTModule:
 
                         continue
 
-                    # We are inside one caller utterance. Keep collecting frames until
-                    # both the normal silence threshold and the final grace window pass.
                     utterance_frames.append(frame)
 
                     if is_speech:
-                        # Caller resumed speech during silence/grace. This is the key
-                        # merge step: cancel the pending flush and keep the same buffer.
                         if maybe_done:
                             grace_resets += 1
                             print(
@@ -482,10 +706,10 @@ class STTModule:
                             f"[STT][{time.time():.3f}] Flush triggered ({reason}), "
                             f"{len(utterance_frames)} frames, {grace_resets} grace reset(s) total."
                         )
-                        async for text in _flush(utterance_frames):
-                            yield text
 
+                        frames_to_flush = utterance_frames
                         utterance_frames = []
+                        ring_pad.clear()
                         in_speech = False
                         trailing_silence = 0
                         maybe_done = False
@@ -493,13 +717,19 @@ class STTModule:
                         grace_resets = 0
                         start_candidate_frames = 0
                         start_candidate_rms_total = 0.0
-                        ring_pad.clear()
+
+                        async for text in _flush(frames_to_flush):
+                            yield text
 
         except asyncio.CancelledError:
-            pass
+            raise
         except Exception as e:
-            print(f"[STT] ❌ Stream error: {e}")
-        finally:
-            if utterance_frames:
-                async for text in _flush(utterance_frames):
-                    yield text
+            print(f"[STT] Stream error: {e}")
+
+    async def transcribe_stream(self, audio_source: AudioSource):
+        if self.use_whisper:
+            async for text in self._transcribe_whisper_stream(audio_source):
+                yield text
+        else:
+            async for text in self._transcribe_soniox_stream(audio_source):
+                yield text
