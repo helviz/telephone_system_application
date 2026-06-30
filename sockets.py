@@ -6,7 +6,6 @@ import logging
 from contextlib import asynccontextmanager
 from urllib.parse import unquote
 
-import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.wsgi import WSGIMiddleware
 from dotenv import load_dotenv
@@ -23,6 +22,14 @@ load_dotenv()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gguf").strip().lower()
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+USE_WHISPER = _env_bool("USE_WHISPER", True)
 
 # ---------------------------------------------------------------------------
 # In-process runtime store — populated by lifespan, read by WebSocket handler
@@ -49,59 +56,90 @@ def _load_models():
     total_start = time.time()
 
     # ------------------------------------------------------------------
-    # STT — OpenAI Whisper via faster-whisper for all IVR-selected languages
-    #   1 -> en, 2 -> fr, 3 -> sw are enforced in routes.py.
-    #   The same model is shared across languages; language is forced per call.
+    # STT — selectable backend
+    #   USE_WHISPER=true  -> preload OpenAI Whisper/faster-whisper locally.
+    #   USE_WHISPER=false -> configure Soniox realtime STT only; no Whisper load.
     # ------------------------------------------------------------------
-    print("📦 [1/3] Loading STT: OpenAI Whisper/faster-whisper for EN/FR/SW...")
-    t = time.time()
-
-    from faster_whisper import WhisperModel
-
-    whisper_model_name = (
-        os.getenv("OPENAI_WHISPER_MODEL")
-        or os.getenv("WHISPER_MODEL_SIZE")
-        or "large-v3"
-    ).strip()
-
-    resolved_device = os.getenv(
-        "WHISPER_DEVICE",
-        "cuda" if torch.cuda.is_available() else "cpu",
-    ).strip()
-    if resolved_device == "cuda" and not torch.cuda.is_available():
-        print("   ⚠️ WHISPER_DEVICE=cuda requested, but CUDA is unavailable. Falling back to CPU.")
-        resolved_device = "cpu"
-
-    faster_compute_type = os.getenv(
-        "WHISPER_COMPUTE_TYPE",
-        "float16" if resolved_device == "cuda" else "int8",
-    ).strip()
-
-    whisper_model = WhisperModel(
-        whisper_model_name,
-        device=resolved_device,
-        compute_type=faster_compute_type,
-        download_root=os.getenv("HF_HOME"),
-    )
-
     _preloaded_stt.clear()
-    for lang in ("en", "fr", "sw"):
-        _preloaded_stt[lang] = {
-            "engine": "faster_whisper",
-            "model": whisper_model,
-            "model_name": whisper_model_name,
-            "device": resolved_device,
-            "forced_language": lang,
-        }
 
-    stt_duration = time.time() - t
-    _safe_log_model_load(f"stt:openai_whisper:{whisper_model_name}", stt_duration, resolved_device)
-    print(
-        "   ✅ STT ready: "
-        f"model=[{whisper_model_name}] backend=[faster-whisper] "
-        f"forced_languages=[en, fr, sw] device=[{resolved_device}] "
-        f"compute_type=[{faster_compute_type}] — {stt_duration:.1f}s\n"
-    )
+    if USE_WHISPER:
+        print("📦 [1/3] Loading STT: OpenAI Whisper/faster-whisper for EN/FR/SW...")
+        t = time.time()
+
+        import torch
+        from faster_whisper import WhisperModel
+
+        whisper_model_name = (
+            os.getenv("OPENAI_WHISPER_MODEL")
+            or os.getenv("WHISPER_MODEL_SIZE")
+            or "large-v3"
+        ).strip()
+
+        resolved_device = os.getenv(
+            "WHISPER_DEVICE",
+            "cuda" if torch.cuda.is_available() else "cpu",
+        ).strip()
+        if resolved_device == "cuda" and not torch.cuda.is_available():
+            print("   ⚠️ WHISPER_DEVICE=cuda requested, but CUDA is unavailable. Falling back to CPU.")
+            resolved_device = "cpu"
+
+        faster_compute_type = os.getenv(
+            "WHISPER_COMPUTE_TYPE",
+            "float16" if resolved_device == "cuda" else "int8",
+        ).strip()
+
+        whisper_model = WhisperModel(
+            whisper_model_name,
+            device=resolved_device,
+            compute_type=faster_compute_type,
+            download_root=os.getenv("HF_HOME"),
+        )
+
+        for lang in ("en", "fr", "sw"):
+            _preloaded_stt[lang] = {
+                "engine": "faster_whisper",
+                "model": whisper_model,
+                "model_name": whisper_model_name,
+                "device": resolved_device,
+                "forced_language": lang,
+            }
+
+        stt_duration = time.time() - t
+        _safe_log_model_load(f"stt:openai_whisper:{whisper_model_name}", stt_duration, resolved_device)
+        print(
+            "   ✅ STT ready: "
+            f"model=[{whisper_model_name}] backend=[faster-whisper] "
+            f"forced_languages=[en, fr, sw] device=[{resolved_device}] "
+            f"compute_type=[{faster_compute_type}] — {stt_duration:.1f}s\n"
+        )
+    else:
+        print("📦 [1/3] Configuring STT: Soniox realtime API (no Whisper preload)...")
+        t = time.time()
+
+        if not os.getenv("SONIOX_API_KEY"):
+            raise RuntimeError("USE_WHISPER=false requires SONIOX_API_KEY in environment/secrets.")
+
+        soniox_stt_model = os.getenv("SONIOX_STT_MODEL", "stt-rt-v5").strip() or "stt-rt-v5"
+        soniox_audio_format = os.getenv("SONIOX_STT_AUDIO_FORMAT", "pcm_s16le").strip() or "pcm_s16le"
+        soniox_sample_rate = int(os.getenv("SONIOX_STT_SAMPLE_RATE", "16000"))
+
+        for lang in ("en", "fr", "sw"):
+            _preloaded_stt[lang] = {
+                "engine": "soniox_realtime",
+                "model_name": soniox_stt_model,
+                "forced_language": lang,
+                "audio_format": soniox_audio_format,
+                "sample_rate": soniox_sample_rate,
+            }
+
+        stt_duration = time.time() - t
+        _safe_log_model_load(f"stt:soniox:{soniox_stt_model}", stt_duration, "api")
+        print(
+            "   ✅ STT ready: "
+            f"model=[{soniox_stt_model}] backend=[soniox-realtime] "
+            f"audio=[{soniox_audio_format}/{soniox_sample_rate}Hz] "
+            f"forced_languages=[en, fr, sw] — {stt_duration:.1f}s\n"
+        )
 
     # ------------------------------------------------------------------
     # TTS — Soniox API configuration only
@@ -188,7 +226,11 @@ async def lifespan(fastapi_app: FastAPI):
 
     # Save active runtime engine attributes back to stats tracker
     stats.model_info["llm_provider"] = LLM_PROVIDER
-    stats.model_info["stt"] = os.getenv("OPENAI_WHISPER_MODEL", os.getenv("WHISPER_MODEL_SIZE", "large-v3"))
+    stats.model_info["stt"] = (
+        os.getenv("OPENAI_WHISPER_MODEL", os.getenv("WHISPER_MODEL_SIZE", "large-v3"))
+        if USE_WHISPER else os.getenv("SONIOX_STT_MODEL", "stt-rt-v5")
+    )
+    stats.model_info["stt_backend"] = "faster-whisper" if USE_WHISPER else "soniox-realtime"
     stats.model_info["stt_languages"] = "1=en, 2=fr, 3=sw"
     yield
     # Free memory maps on down-scale/shutdown sequences
