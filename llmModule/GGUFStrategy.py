@@ -200,7 +200,7 @@ class GGUFStrategy(LLMStrategy):
             # Pre-fill empty think block so the model skips thinking entirely
             # and starts generating real content immediately.
             # Required because chat_template_kwargs is unsupported on this build.
-            {"role": "assistant", "content": "<think>\n\n</think>\n\n"},
+            #{"role": "assistant", "content": "<think>\n\n</think>\n\n"},
         ]
 
         generation_kwargs: dict[str, Any] = {
