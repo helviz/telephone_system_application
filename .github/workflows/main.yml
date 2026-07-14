@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Sync to Hugging Face
-        uses: huggingface/hub-sync@v0.1.0
+        uses: huggingface/hub-sync@v0.2.0
         with:
           github_repo_id: ${{ github.repository }}
           huggingface_repo_id: helviz/gsm_voice
